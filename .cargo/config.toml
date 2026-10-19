@@ -1,0 +1,6 @@
+[build]
+target = "x86_64-pc-windows-msvc"
+
+[target.x86_64-pc-windows-msvc]
+# 静态链接 C 运行库：生成的 exe 不依赖 VC++ 运行库，可直接拷到内网机运行
+rustflags = ["-C", "target-feature=+crt-static", "-C", "target-cpu=x86-64-v2"]

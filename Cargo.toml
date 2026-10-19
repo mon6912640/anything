@@ -1,0 +1,67 @@
+[package]
+name = "anything"
+version = "0.1.0"
+edition = "2024"
+description = "无需管理员权限的本地文件名极速搜索（类 Everything）"
+
+[lib]
+name = "anything"
+path = "src/lib.rs"
+
+# 图形界面主程序
+[[bin]]
+name = "anything"
+path = "src/main.rs"
+
+# 命令行搜索工具（类似 Everything 的 es.exe），供第三方程序调用
+[[bin]]
+name = "ae"
+path = "src/bin/ae.rs"
+
+# 开发用：性能测试 / 自测
+[[bin]]
+name = "anything-bench"
+path = "src/bin/bench.rs"
+
+[dependencies]
+memchr = "2.8.3"
+pinyin = { version = "0.11.0", default-features = false, features = ["plain"] }
+rayon = "1.12.0"
+regex = "1.13.1"
+
+[dependencies.windows-sys]
+version = "0.61.2"
+features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Ioctl",
+    "Win32_System_Threading",
+    "Win32_System_Pipes",
+    "Win32_System_Time",
+    "Win32_System_SystemInformation",
+    "Win32_System_SystemServices",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Com",
+    "Win32_System_Ole",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+    "Win32_System_Registry",
+    "Win32_System_Console",
+    "Win32_System_ProcessStatus",
+    "Win32_Globalization",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Controls",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input_KeyboardAndMouse",
+]
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
