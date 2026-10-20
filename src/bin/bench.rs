@@ -190,11 +190,61 @@ fn live() {
     }
 }
 
+/// 解码图片并输出信息；给出输出文件时把结果叠在棋盘格上存成 BMP，方便目测
+fn pic(args: &[String]) {
+    use anything::picture;
+    picture::com_init();
+    let (bw, bh) = (args.get(1).and_then(|s| s.parse().ok()).unwrap_or(600), args.get(2).and_then(|s| s.parse().ok()).unwrap_or(600));
+    let Some(path) = args.first() else { return };
+    let t = Instant::now();
+    match picture::load(path, bw, bh) {
+        Ok(p) => {
+            println!(
+                "框 {}x{} -> {}x{} 原图 {}x{} {} {} alpha={} {:?} {:.1}ms",
+                bw, bh, p.w, p.h, p.src_w, p.src_h, p.format, p.detail, p.alpha, p.kind, t.elapsed().as_secs_f64() * 1000.0
+            );
+            if let Some(out) = args.get(3) {
+                let (w, h) = (p.w as usize, p.h as usize);
+                let mut img = Vec::with_capacity(w * h * 3);
+                for y in (0..h).rev() {
+                    for x in 0..w {
+                        let s = &p.bgra[(y * w + x) * 4..][..4];
+                        let bg = if ((x / 8) + (y / 8)) % 2 == 0 { 255u32 } else { 220 };
+                        for c in 0..3 {
+                            img.push((s[c] as u32 + bg * (255 - s[3] as u32) / 255).min(255) as u8);
+                        }
+                    }
+                    img.resize(img.len().next_multiple_of(4), 0);
+                }
+                let mut f = Vec::new();
+                f.extend_from_slice(b"BM");
+                f.extend_from_slice(&((54 + img.len()) as u32).to_le_bytes());
+                f.extend_from_slice(&[0, 0, 0, 0, 54, 0, 0, 0, 40, 0, 0, 0]);
+                f.extend_from_slice(&(w as i32).to_le_bytes());
+                f.extend_from_slice(&(h as i32).to_le_bytes());
+                f.extend_from_slice(&[1, 0, 24, 0]);
+                f.extend_from_slice(&[0u8; 24]);
+                f.extend_from_slice(&img);
+                std::fs::write(out, f).unwrap();
+            }
+        }
+        Err(e) => println!("失败: {e} ({:.1}ms)", t.elapsed().as_secs_f64() * 1000.0),
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("scan") => scan(&args[1..]),
         Some("live") => live(),
-        _ => eprintln!("用法: anything-bench scan [根目录...] | live"),
+        Some("pic") => {
+            for f in args[1..].iter().filter(|a| a.contains('.') && a.parse::<f64>().is_err() && !a.ends_with(".bmp")) {
+                let mut a = vec![f.clone()];
+                a.extend(args[1..].iter().filter(|x| x.parse::<u32>().is_ok() || x.ends_with(".bmp")).cloned());
+                print!("{f}: ");
+                pic(&a);
+            }
+        }
+        _ => eprintln!("用法: anything-bench scan [根目录...] | live | pic <图片...> [宽 高] [输出.bmp]"),
     }
 }

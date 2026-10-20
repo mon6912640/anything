@@ -6,12 +6,13 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering::Relaxed, Ordering::SeqCst};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::Instant;
 
 use anything::config::{self, Config};
 use anything::engine::{Engine, Hits, Notice};
 use anything::ipc;
+use anything::picture::{self, Kind, Picture};
 use anything::query::SortCol;
 use anything::util::{format_filetime, format_size_kb, group_digits, wide};
 
@@ -39,9 +40,14 @@ const WM_APP_RESULT: u32 = WM_APP + 1;
 const WM_APP_INDEX: u32 = WM_APP + 2;
 const WM_APP_TRAY: u32 = WM_APP + 3;
 const WM_APP_SHOW: u32 = WM_APP + 4;
+const WM_APP_PREVIEW: u32 = WM_APP + 5;
+
+const PV_CLASS: &str = "AnythingPreview";
 
 const TIMER_SEARCH: usize = 1;
 const TIMER_UI: usize = 2;
+const TIMER_PREVIEW: usize = 3;
+const TIMER_PV_LOADING: usize = 4;
 const HOTKEY_ID: i32 = 1;
 
 const IDM_RESCAN: usize = 1001;
@@ -53,6 +59,7 @@ const IDM_EXIT: usize = 1006;
 const IDM_HELP: usize = 1010;
 const IDM_CLI: usize = 1011;
 const IDM_ABOUT: usize = 1012;
+const IDM_PREVIEW: usize = 1020;
 
 const IDC_OPEN: usize = 2001;
 const IDC_FOLDER: usize = 2002;
@@ -93,6 +100,7 @@ const HELP_TEXT: &str = "搜索语法（与 Everything 接近）：
   Enter           打开        Ctrl+Enter   打开所在文件夹
   Ctrl+C          复制完整路径  Ctrl+Shift+C 复制文件（可在资源管理器粘贴）
   Esc             清空搜索 / 隐藏窗口
+  F3              显示/隐藏右侧图片预览（可拖动分隔条调宽度，双击预览图打开）
   F5              立即重建索引
   结果可以直接拖到资源管理器或其他程序中";
 
@@ -121,6 +129,61 @@ struct Pending {
     seq: u64,
     keep: bool,
     res: Result<Hits, String>,
+}
+
+/// 预览面板正在显示的条目
+#[derive(Clone, PartialEq)]
+struct Target {
+    path: String,
+    name: String,
+    dir: bool,
+    size: u64,
+    mtime: u64,
+    image: bool,
+}
+
+/// 文件身份：路径 + 大小 + 修改时间（文件被改动后会重新解码）
+type FileKey = (String, u64, u64);
+
+struct PvReq {
+    seq: u64,
+    path: String,
+    bw: u32,
+    bh: u32,
+}
+
+struct PvDone {
+    seq: u64,
+    res: Result<Picture, String>,
+}
+
+struct Preview {
+    hwnd: HWND,
+    on: bool,
+    /// 面板宽度（96 DPI 下的逻辑像素）
+    width: i32,
+    dragging: bool,
+    split: RECT,
+    target: Option<Target>,
+    /// 最近一次解码结果及其所属文件
+    shown: Option<(FileKey, Result<Arc<Picture>, String>)>,
+    dib: HBITMAP,
+    dib_of: *const Picture,
+    loading: bool,
+    /// 加载超过一小会儿后不再显示上一张图
+    blank_old: bool,
+    req: Option<(FileKey, u32, u32)>,
+    seq: u64,
+    latest: Arc<AtomicU64>,
+    tx: Option<mpsc::Sender<PvReq>>,
+    done: Arc<Mutex<Option<PvDone>>>,
+    cache: Vec<(FileKey, Arc<Picture>)>,
+    icon: HICON,
+    checker: HBRUSH,
+    checker_bmp: HBITMAP,
+    checker_dpi: u32,
+    line_h: i32,
+    big_h: i32,
 }
 
 struct App {
@@ -153,6 +216,7 @@ struct App {
     taskbar_created: u32,
     quitting: bool,
     hinted: bool,
+    pv: Preview,
 }
 
 static APP: AtomicPtr<App> = AtomicPtr::new(null_mut());
@@ -273,8 +337,34 @@ fn main() {
         taskbar_created: unsafe { RegisterWindowMessageW(wide("TaskbarCreated").as_ptr()) },
         quitting: false,
         hinted: false,
+        pv: Preview {
+            hwnd: null_mut(),
+            on: true,
+            width: 360,
+            dragging: false,
+            split: unsafe { std::mem::zeroed() },
+            target: None,
+            shown: None,
+            dib: null_mut(),
+            dib_of: null(),
+            loading: false,
+            blank_old: false,
+            req: None,
+            seq: 0,
+            latest: Arc::new(AtomicU64::new(0)),
+            tx: None,
+            done: Arc::new(Mutex::new(None)),
+            cache: Vec::new(),
+            icon: null_mut(),
+            checker: null_mut(),
+            checker_bmp: null_mut(),
+            checker_dpi: 0,
+            line_h: 16,
+            big_h: 20,
+        },
     });
     APP.store(Box::into_raw(app_box), SeqCst);
+    ui_load();
 
     let class = wide(CLASS);
     unsafe {
@@ -293,6 +383,22 @@ fn main() {
             hIconSm: icon_small,
         };
         RegisterClassExW(&wc);
+        let pv_class = wide(PV_CLASS);
+        let pwc = WNDCLASSEXW {
+            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+            style: CS_DBLCLKS,
+            lpfnWndProc: Some(pv_proc),
+            cbClsExtra: 0,
+            cbWndExtra: 0,
+            hInstance: hinst,
+            hIcon: null_mut(),
+            hCursor: LoadCursorW(null_mut(), IDC_ARROW),
+            hbrBackground: null_mut(),
+            lpszMenuName: null(),
+            lpszClassName: pv_class.as_ptr(),
+            hIconSm: null_mut(),
+        };
+        RegisterClassExW(&pwc);
         let menu = build_menu();
         app().menu = menu;
         let hwnd = CreateWindowExW(
@@ -353,11 +459,17 @@ unsafe fn build_menu() -> HMENU {
         if autostart_get() {
             CheckMenuItem(file, IDM_AUTOSTART as u32, MF_CHECKED);
         }
+        let view = CreatePopupMenu();
+        add(view, IDM_PREVIEW, "图片预览面板(&P)\tF3");
+        if app().pv.on {
+            CheckMenuItem(view, IDM_PREVIEW as u32, MF_CHECKED);
+        }
         let help = CreatePopupMenu();
         add(help, IDM_HELP, "搜索语法与快捷键(&H)\tF1");
         add(help, IDM_CLI, "命令行工具 ae.exe(&C)");
         add(help, IDM_ABOUT, "关于(&A)");
         AppendMenuW(bar, MF_POPUP, file as usize, wide("文件(&F)").as_ptr());
+        AppendMenuW(bar, MF_POPUP, view as usize, wide("查看(&V)").as_ptr());
         AppendMenuW(bar, MF_POPUP, help as usize, wide("帮助(&H)").as_ptr());
         bar
     }
@@ -433,6 +545,17 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                         start_search(false);
                     }
                     TIMER_UI => on_ui_timer(),
+                    TIMER_PREVIEW => {
+                        KillTimer(hwnd, TIMER_PREVIEW);
+                        pv_update();
+                    }
+                    TIMER_PV_LOADING => {
+                        KillTimer(hwnd, TIMER_PV_LOADING);
+                        if a.pv.loading {
+                            a.pv.blank_old = true;
+                            InvalidateRect(a.pv.hwnd, null(), 0);
+                        }
+                    }
                     _ => {}
                 }
                 return 0;
@@ -445,6 +568,52 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             WM_APP_INDEX => {
                 if wp == Notice::Replaced as usize {
                     start_search(true);
+                }
+                return 0;
+            }
+            WM_APP_PREVIEW => {
+                pv_on_done();
+                return 0;
+            }
+            // 列表和预览面板之间的分隔条
+            WM_SETCURSOR => {
+                if wp as HWND == hwnd && a.pv.on {
+                    let mut pt: POINT = std::mem::zeroed();
+                    GetCursorPos(&mut pt);
+                    ScreenToClient(hwnd, &mut pt);
+                    if PtInRect(&a.pv.split, pt) != 0 {
+                        SetCursor(LoadCursorW(null_mut(), IDC_SIZEWE));
+                        return 1;
+                    }
+                }
+            }
+            WM_LBUTTONDOWN => {
+                let pt = POINT { x: (lp & 0xffff) as i16 as i32, y: ((lp >> 16) & 0xffff) as i16 as i32 };
+                if a.pv.on && PtInRect(&a.pv.split, pt) != 0 {
+                    a.pv.dragging = true;
+                    SetCapture(hwnd);
+                }
+                return 0;
+            }
+            WM_MOUSEMOVE => {
+                if a.pv.dragging {
+                    let x = (lp & 0xffff) as i16 as i32;
+                    let mut rc: RECT = std::mem::zeroed();
+                    GetClientRect(hwnd, &mut rc);
+                    let pw = rc.right - x - scale(3);
+                    a.pv.width = (pw * 96 / a.dpi as i32).max(160);
+                    layout();
+                    UpdateWindow(hwnd);
+                }
+                return 0;
+            }
+            WM_LBUTTONUP | WM_CAPTURECHANGED => {
+                if a.pv.dragging {
+                    a.pv.dragging = false;
+                    if msg == WM_LBUTTONUP {
+                        ReleaseCapture();
+                    }
+                    ui_save();
                 }
                 return 0;
             }
@@ -568,6 +737,8 @@ unsafe fn create_children(hwnd: HWND) {
         send(a.list, LVM_SETIMAGELIST, LVSIL_SMALL as usize, himl as isize);
         update_sort_arrows();
 
+        a.pv.hwnd = CreateWindowExW(0, wide(PV_CLASS).as_ptr(), null(), WS_CHILD | WS_CLIPSIBLINGS, 0, 0, 0, 0, hwnd, 103 as HMENU, hinst, null());
+
         a.status = CreateWindowExW(0, STATUSCLASSNAMEW, null(), WS_CHILD | WS_VISIBLE | SBARS_SIZEGRIP, 0, 0, 0, 0, hwnd, 102 as HMENU, hinst, null());
         send(a.status, WM_SETFONT, a.font as usize, 1);
     }
@@ -592,7 +763,22 @@ unsafe fn layout() {
         let eh = scale(30);
         MoveWindow(a.edit, m, m, w - 2 * m, eh, 1);
         let top = eh + 2 * m;
-        MoveWindow(a.list, 0, top, w, (h - top - sh).max(0), 1);
+        let lh = (h - top - sh).max(0);
+        if a.pv.on {
+            let gap = scale(6);
+            let pw = scale(a.pv.width).min(w - gap - scale(160)).max(scale(160)).min(w);
+            let lw = (w - pw - gap).max(0);
+            MoveWindow(a.list, 0, top, lw, lh, 1);
+            MoveWindow(a.pv.hwnd, w - pw, top, pw, lh, 1);
+            ShowWindow(a.pv.hwnd, SW_SHOWNA);
+            a.pv.split = RECT { left: lw, top, right: w - pw, bottom: top + lh };
+            pv_metrics();
+            pv_schedule(150);
+        } else {
+            MoveWindow(a.list, 0, top, w, lh, 1);
+            ShowWindow(a.pv.hwnd, SW_HIDE);
+            a.pv.split = std::mem::zeroed();
+        }
     }
 }
 
@@ -689,6 +875,7 @@ fn on_result() {
                 InvalidateRect(a.list, null(), 0);
                 a.count_text = format!("{} 个对象    {:.1} ms", group_digits(n as u64), h.millis);
                 a.last_refresh = Instant::now();
+                pv_schedule(30);
             }
         }
         let t = wide(&a.count_text);
@@ -1064,6 +1251,7 @@ fn on_notify(h: &NMHDR, lp: LPARAM) -> LRESULT {
             NM_RETURN => activate(ctrl_down()),
             NM_RCLICK => context_menu(),
             LVN_BEGINDRAG => begin_drag(),
+            LVN_ITEMCHANGED | LVN_ODSTATECHANGED => pv_schedule(30),
             LVN_COLUMNCLICK => {
                 let nm = &*(lp as *const NMLISTVIEW);
                 let col = match nm.iSubItem {
@@ -1094,6 +1282,7 @@ fn on_notify(h: &NMHDR, lp: LPARAM) -> LRESULT {
                         SetFocus(a.edit);
                     }
                     VK_F1 => on_command(IDM_HELP),
+                    VK_F3 => on_command(IDM_PREVIEW),
                     VK_F5 => on_command(IDM_RESCAN),
                     _ => {}
                 }
@@ -1146,6 +1335,10 @@ unsafe extern "system" fn edit_proc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM, _
                     on_command(IDM_HELP);
                     return 0;
                 }
+                VK_F3 => {
+                    on_command(IDM_PREVIEW);
+                    return 0;
+                }
                 VK_F5 => {
                     on_command(IDM_RESCAN);
                     return 0;
@@ -1175,6 +1368,542 @@ unsafe extern "system" fn edit_proc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM, _
             _ => {}
         }
         DefSubclassProc(h, msg, wp, lp)
+    }
+}
+
+// ---------------------------------------------------------------- 图片预览面板
+
+fn ui_path() -> std::path::PathBuf {
+    config::data_dir().join("ui.ini")
+}
+
+/// 界面状态（预览面板开关和宽度），和用户手写的 settings.ini 分开保存
+fn ui_load() {
+    let a = app();
+    let Ok(text) = std::fs::read_to_string(ui_path()) else { return };
+    for line in text.lines() {
+        let Some((k, v)) = line.split_once('=') else { continue };
+        match k.trim() {
+            "preview" => a.pv.on = v.trim() != "0",
+            "preview_width" => {
+                if let Ok(w) = v.trim().parse::<i32>() {
+                    a.pv.width = w.clamp(160, 4000);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn ui_save() {
+    let a = app();
+    let _ = std::fs::write(ui_path(), format!("preview={}\npreview_width={}\n", a.pv.on as u8, a.pv.width));
+}
+
+fn pv_toggle() {
+    let a = app();
+    a.pv.on = !a.pv.on;
+    unsafe {
+        CheckMenuItem(GetSubMenu(a.menu, 1), IDM_PREVIEW as u32, if a.pv.on { MF_CHECKED } else { MF_UNCHECKED });
+    }
+    if !a.pv.on {
+        pv_clear();
+        a.pv.cache.clear();
+    }
+    unsafe { layout() };
+    pv_schedule(0);
+    ui_save();
+}
+
+fn pv_clear() {
+    let a = app();
+    a.pv.target = None;
+    a.pv.shown = None;
+    a.pv.loading = false;
+    a.pv.req = None;
+    unsafe {
+        if !a.pv.dib.is_null() {
+            DeleteObject(a.pv.dib as HGDIOBJ);
+            a.pv.dib = null_mut();
+        }
+        a.pv.dib_of = null();
+        if !a.pv.icon.is_null() {
+            DestroyIcon(a.pv.icon);
+            a.pv.icon = null_mut();
+        }
+    }
+}
+
+fn pv_schedule(ms: u32) {
+    let a = app();
+    if a.pv.on && !a.hwnd.is_null() {
+        unsafe { SetTimer(a.hwnd, TIMER_PREVIEW, ms.max(1), None) };
+    }
+}
+
+fn font_height(font: HFONT) -> i32 {
+    unsafe {
+        let dc = GetDC(null_mut());
+        let old = SelectObject(dc, font as HGDIOBJ);
+        let mut tm: TEXTMETRICW = std::mem::zeroed();
+        GetTextMetricsW(dc, &mut tm);
+        SelectObject(dc, old);
+        ReleaseDC(null_mut(), dc);
+        tm.tmHeight + tm.tmExternalLeading
+    }
+}
+
+fn pv_metrics() {
+    let a = app();
+    a.pv.line_h = font_height(a.font);
+    a.pv.big_h = font_height(a.font_big);
+}
+
+/// 面板内的 (图片区, 信息区)
+fn pv_rects() -> (RECT, RECT) {
+    let a = app();
+    let mut rc: RECT = unsafe { std::mem::zeroed() };
+    unsafe { GetClientRect(a.pv.hwnd, &mut rc) };
+    let pad = scale(10);
+    let info_h = a.pv.big_h + a.pv.line_h * 6 + scale(14);
+    let info = RECT { left: pad, top: (rc.bottom - info_h - pad / 2).max(pad), right: rc.right - pad, bottom: rc.bottom - pad / 2 };
+    let img = RECT { left: pad, top: pad, right: rc.right - pad, bottom: (info.top - pad).max(pad) };
+    (img, info)
+}
+
+fn pv_box() -> (u32, u32) {
+    let (img, _) = pv_rects();
+    ((img.right - img.left).max(0) as u32, (img.bottom - img.top).max(0) as u32)
+}
+
+/// 选中的条目：优先焦点行（且被选中），否则第一个选中行
+fn current_target() -> Option<Target> {
+    let a = app();
+    let f = unsafe { focused_index() };
+    let focus_sel = f >= 0 && unsafe { send(a.list, LVM_GETITEMSTATE, f as usize, LVIS_SELECTED as isize) } as u32 & LVIS_SELECTED != 0;
+    let row = if focus_sel { f as isize } else { unsafe { send(a.list, LVM_GETNEXTITEM, usize::MAX, LVNI_SELECTED as isize) } };
+    if row < 0 || row as usize >= a.results.len() {
+        return None;
+    }
+    let ix = a.engine.index.read().unwrap();
+    let id = a.results[row as usize];
+    if a.res_gen != a.engine.generation.load(SeqCst) || id as usize >= ix.len() {
+        return None;
+    }
+    let dir = ix.is_dir(id);
+    let name = ix.name(id).to_string();
+    Some(Target {
+        path: ix.full_path(id),
+        image: !dir && picture::is_image(&name),
+        name,
+        dir,
+        size: ix.size[id as usize],
+        mtime: ix.mtime[id as usize],
+    })
+}
+
+fn file_key(t: &Target) -> FileKey {
+    (t.path.clone(), t.size, t.mtime)
+}
+
+/// 已解码的图是否适合当前的框（大图缩小过的，框变了要按新尺寸重新解码）
+fn pic_fits(p: &Picture, bw: u32, bh: u32) -> bool {
+    let close = |a: (u32, u32), b: (u32, u32)| a.0.abs_diff(b.0) <= 1 && a.1.abs_diff(b.1) <= 1;
+    match p.kind {
+        Kind::Raster => close(picture::fit(p.src_w, p.src_h, bw, bh, false), (p.w, p.h)),
+        Kind::Vector => {
+            let want = picture::fit(p.src_w, p.src_h, bw, bh, true);
+            want.0.abs_diff(p.w) * 50 <= p.w.max(1) && want.1.abs_diff(p.h) * 50 <= p.h.max(1)
+        }
+        Kind::Thumb => p.w <= bw && p.h <= bh && bw.abs_diff(p.box_w) * 10 <= p.box_w && bh.abs_diff(p.box_h) * 10 <= p.box_h,
+    }
+}
+
+fn pv_update() {
+    let a = app();
+    if !a.pv.on {
+        return;
+    }
+    let t = current_target();
+    if t != a.pv.target {
+        a.pv.target = t.clone();
+        unsafe {
+            if !a.pv.icon.is_null() {
+                DestroyIcon(a.pv.icon);
+                a.pv.icon = null_mut();
+            }
+        }
+        if let Some(t) = t.as_ref().filter(|t| !t.image) {
+            a.pv.icon = big_icon(&t.path, t.dir);
+        }
+        unsafe { InvalidateRect(a.pv.hwnd, null(), 0) };
+    }
+    let Some(t) = t.filter(|t| t.image) else {
+        a.pv.loading = false;
+        a.pv.req = None;
+        return;
+    };
+    let (bw, bh) = pv_box();
+    if bw < 8 || bh < 8 {
+        return;
+    }
+    let key = file_key(&t);
+    let ok = match &a.pv.shown {
+        Some((k, Ok(p))) => *k == key && pic_fits(p, bw, bh),
+        Some((k, Err(_))) => *k == key,
+        None => false,
+    };
+    if ok {
+        a.pv.loading = false;
+        a.pv.req = None;
+        return;
+    }
+    if let Some(p) = a.pv.cache.iter().find(|(k, p)| *k == key && pic_fits(p, bw, bh)).map(|(_, p)| p.clone()) {
+        a.pv.loading = false;
+        a.pv.req = None;
+        a.pv.shown = Some((key, Ok(p)));
+        unsafe { InvalidateRect(a.pv.hwnd, null(), 0) };
+        return;
+    }
+    if a.pv.loading && a.pv.req.as_ref() == Some(&(key.clone(), bw, bh)) {
+        return;
+    }
+    // 交给后台线程解码；只有和当前显示的是同一个文件（只是尺寸变了）时才继续显示旧图
+    a.pv.seq += 1;
+    a.pv.latest.store(a.pv.seq, SeqCst);
+    a.pv.req = Some((key.clone(), bw, bh));
+    a.pv.loading = true;
+    a.pv.blank_old = false;
+    pv_send(PvReq { seq: a.pv.seq, path: t.path.clone(), bw, bh });
+    unsafe {
+        SetTimer(a.hwnd, TIMER_PV_LOADING, 150, None);
+        InvalidateRect(a.pv.hwnd, null(), 0);
+    }
+}
+
+fn pv_send(req: PvReq) {
+    let a = app();
+    if a.pv.tx.is_none() {
+        let (tx, rx) = mpsc::channel::<PvReq>();
+        let done = a.pv.done.clone();
+        let latest = a.pv.latest.clone();
+        let hwnd = a.hwnd as isize;
+        let spawned = std::thread::Builder::new().name("anything-preview".into()).spawn(move || {
+            picture::com_init();
+            while let Ok(mut r) = rx.recv() {
+                // 快速翻动时只解最后一张
+                while let Ok(n) = rx.try_recv() {
+                    r = n;
+                }
+                if latest.load(SeqCst) != r.seq {
+                    continue;
+                }
+                let res = picture::load(&r.path, r.bw, r.bh);
+                *done.lock().unwrap() = Some(PvDone { seq: r.seq, res });
+                unsafe { PostMessageW(hwnd as HWND, WM_APP_PREVIEW, 0, 0) };
+            }
+        });
+        if spawned.is_err() {
+            return;
+        }
+        a.pv.tx = Some(tx);
+    }
+    let _ = a.pv.tx.as_ref().unwrap().send(req);
+}
+
+fn pv_on_done() {
+    let a = app();
+    let Some(d) = a.pv.done.lock().unwrap().take() else { return };
+    if d.seq != a.pv.seq || !a.pv.on {
+        return;
+    }
+    let Some((key, _, _)) = a.pv.req.take() else { return };
+    a.pv.loading = false;
+    unsafe { KillTimer(a.hwnd, TIMER_PV_LOADING) };
+    let res = d.res.map(Arc::new);
+    if let Ok(p) = &res {
+        // 缓存最近解码的图，在同名文件之间来回切换时立即显示（总量约 64MB 以内）
+        a.pv.cache.retain(|(k, _)| *k != key);
+        a.pv.cache.push((key.clone(), p.clone()));
+        let mut total: usize = a.pv.cache.iter().map(|(_, p)| p.bgra.len()).sum();
+        while total > 64 << 20 && a.pv.cache.len() > 1 {
+            total -= a.pv.cache.remove(0).1.bgra.len();
+        }
+    }
+    a.pv.shown = Some((key, res));
+    unsafe { InvalidateRect(a.pv.hwnd, null(), 0) };
+}
+
+/// 非图片文件显示大图标（48px 系统图标）
+fn big_icon(path: &str, dir: bool) -> HICON {
+    const IID_IIMAGELIST: GUID = GUID::from_u128(0x46eb5926_582e_4017_9fdf_e8998daa0950);
+    unsafe {
+        let mut sfi: SHFILEINFOW = std::mem::zeroed();
+        let attr = if dir { FILE_ATTRIBUTE_DIRECTORY } else { FILE_ATTRIBUTE_NORMAL };
+        let mut r = SHGetFileInfoW(wide(path).as_ptr(), 0, &mut sfi, std::mem::size_of::<SHFILEINFOW>() as u32, SHGFI_SYSICONINDEX);
+        if r == 0 {
+            r = SHGetFileInfoW(wide(path).as_ptr(), attr, &mut sfi, std::mem::size_of::<SHFILEINFOW>() as u32, SHGFI_SYSICONINDEX | SHGFI_USEFILEATTRIBUTES);
+        }
+        if r == 0 {
+            return null_mut();
+        }
+        let mut iml: *mut c_void = null_mut();
+        if SHGetImageList(SHIL_EXTRALARGE as i32, &IID_IIMAGELIST, &mut iml) < 0 || iml.is_null() {
+            return null_mut();
+        }
+        // IImageList 指针可以直接当 HIMAGELIST 用
+        ImageList_GetIcon(iml as HIMAGELIST, sfi.iIcon, ILD_TRANSPARENT)
+    }
+}
+
+unsafe fn make_dib(p: &Picture) -> HBITMAP {
+    unsafe {
+        let mut bi: BITMAPINFO = std::mem::zeroed();
+        bi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
+        bi.bmiHeader.biWidth = p.w as i32;
+        bi.bmiHeader.biHeight = -(p.h as i32);
+        bi.bmiHeader.biPlanes = 1;
+        bi.bmiHeader.biBitCount = 32;
+        let mut bits: *mut c_void = null_mut();
+        let hb = CreateDIBSection(null_mut(), &bi, DIB_RGB_COLORS, &mut bits, null_mut(), 0);
+        if !hb.is_null() && !bits.is_null() {
+            std::ptr::copy_nonoverlapping(p.bgra.as_ptr(), bits as *mut u8, p.bgra.len());
+        }
+        hb
+    }
+}
+
+/// 透明背景用的灰白棋盘格
+unsafe fn ensure_checker() {
+    let a = app();
+    if !a.pv.checker.is_null() && a.pv.checker_dpi == a.dpi {
+        return;
+    }
+    unsafe {
+        if !a.pv.checker.is_null() {
+            DeleteObject(a.pv.checker as HGDIOBJ);
+            DeleteObject(a.pv.checker_bmp as HGDIOBJ);
+        }
+        let c = scale(8).max(4);
+        let sdc = GetDC(null_mut());
+        let mdc = CreateCompatibleDC(sdc);
+        let bm = CreateCompatibleBitmap(sdc, c * 2, c * 2);
+        ReleaseDC(null_mut(), sdc);
+        let old = SelectObject(mdc, bm as HGDIOBJ);
+        let white = CreateSolidBrush(0xFFFFFF);
+        let gray = CreateSolidBrush(0xE3E3E3);
+        FillRect(mdc, &RECT { left: 0, top: 0, right: c * 2, bottom: c * 2 }, white);
+        FillRect(mdc, &RECT { left: c, top: 0, right: c * 2, bottom: c }, gray);
+        FillRect(mdc, &RECT { left: 0, top: c, right: c, bottom: c * 2 }, gray);
+        SelectObject(mdc, old);
+        DeleteDC(mdc);
+        DeleteObject(white as HGDIOBJ);
+        DeleteObject(gray as HGDIOBJ);
+        a.pv.checker_bmp = bm;
+        a.pv.checker = CreatePatternBrush(bm);
+        a.pv.checker_dpi = a.dpi;
+    }
+}
+
+unsafe fn draw_text(dc: HDC, s: &str, rc: &RECT, flags: u32, color: u32, font: HFONT) {
+    unsafe {
+        let w: Vec<u16> = s.encode_utf16().collect();
+        let mut r = *rc;
+        SelectObject(dc, font as HGDIOBJ);
+        SetTextColor(dc, color);
+        DrawTextW(dc, w.as_ptr(), w.len() as i32, &mut r, flags | DT_NOPREFIX);
+    }
+}
+
+fn ext_upper(name: &str) -> String {
+    match name.rfind('.') {
+        Some(p) if p > 0 => name[p + 1..].to_uppercase(),
+        _ => String::new(),
+    }
+}
+
+unsafe fn pv_paint(h: HWND) {
+    unsafe {
+        let a = app();
+        let mut ps: PAINTSTRUCT = std::mem::zeroed();
+        let hdc = BeginPaint(h, &mut ps);
+        let mut rc: RECT = std::mem::zeroed();
+        GetClientRect(h, &mut rc);
+        let (w, hh) = (rc.right.max(1), rc.bottom.max(1));
+        let mdc = CreateCompatibleDC(hdc);
+        let mbm = CreateCompatibleBitmap(hdc, w, hh);
+        let old_bm = SelectObject(mdc, mbm as HGDIOBJ);
+        let old_font = SelectObject(mdc, a.font as HGDIOBJ);
+        FillRect(mdc, &rc, GetSysColorBrush(COLOR_WINDOW));
+        let line = CreateSolidBrush(0xDADADA);
+        FillRect(mdc, &RECT { left: 0, top: 0, right: 1, bottom: hh }, line);
+        DeleteObject(line as HGDIOBJ);
+        SetBkMode(mdc, TRANSPARENT as i32);
+
+        let text = GetSysColor(COLOR_WINDOWTEXT);
+        let gray = GetSysColor(COLOR_GRAYTEXT);
+        let (img, info) = pv_rects();
+        let middle = |s: &str| {
+            let mut r = img;
+            let ws: Vec<u16> = s.encode_utf16().collect();
+            SelectObject(mdc, a.font as HGDIOBJ);
+            DrawTextW(mdc, ws.as_ptr(), ws.len() as i32, &mut r, DT_CALCRECT | DT_CENTER | DT_WORDBREAK | DT_NOPREFIX);
+            let th = r.bottom - r.top;
+            let top = img.top + ((img.bottom - img.top - th) / 2).max(0);
+            draw_text(mdc, s, &RECT { left: img.left, top, right: img.right, bottom: img.bottom }, DT_CENTER | DT_WORDBREAK, gray, a.font);
+        };
+
+        // 当前要显示的位图：属于当前条目；或者还在加载中、暂时保留同一个文件或上一张的图
+        let mut line2 = String::new();
+        let mut line3 = String::new();
+        match &a.pv.target {
+            None => middle("选中图片后在这里预览\n\nF3 显示 / 隐藏预览面板\n拖动左侧分隔条调整宽度"),
+            Some(t) if t.image => {
+                let key = file_key(t);
+                let mine = a.pv.shown.as_ref().filter(|(k, _)| *k == key);
+                let pic = match (mine, &a.pv.shown) {
+                    (Some((_, Ok(p))), _) => Some(p.clone()),
+                    (None, Some((_, Ok(p)))) if a.pv.loading && !a.pv.blank_old => Some(p.clone()),
+                    _ => None,
+                };
+                match mine {
+                    Some((_, Ok(p))) => {
+                        if p.kind == Kind::Thumb {
+                            line2 = format!("{} · {}", p.format, p.detail);
+                        } else {
+                            let mut v = vec![format!("{} × {}", p.src_w, p.src_h), p.format.clone()];
+                            if !p.detail.is_empty() {
+                                v.push(p.detail.clone());
+                            }
+                            line2 = v.join(" · ");
+                        }
+                        let (img_w, img_h) = ((img.right - img.left) as u32, (img.bottom - img.top) as u32);
+                        let (dw, _) = if p.w <= img_w && p.h <= img_h { (p.w, p.h) } else { picture::fit(p.w, p.h, img_w, img_h, false) };
+                        let scale_txt = match p.kind {
+                            Kind::Thumb => String::new(),
+                            Kind::Vector => format!("按面板大小渲染（{}%）", (dw as f64 * 100.0 / p.src_w.max(1) as f64).round()),
+                            Kind::Raster if dw == p.src_w => "原始大小（1:1）".to_string(),
+                            Kind::Raster => format!("缩小显示 {}%", ((dw as f64 * 100.0 / p.src_w.max(1) as f64).round() as u32).max(1)),
+                        };
+                        let alpha = if p.alpha { "含透明" } else { "不透明" };
+                        line3 = if scale_txt.is_empty() { alpha.to_string() } else { format!("{alpha} · {scale_txt}") };
+                    }
+                    Some((_, Err(e))) => {
+                        line2 = "无法预览".into();
+                        middle(&format!("无法预览\n{e}"));
+                    }
+                    None => {
+                        line2 = "正在加载…".into();
+                        if pic.is_none() {
+                            middle("正在加载…");
+                        }
+                    }
+                }
+                if let Some(p) = pic {
+                    if a.pv.dib_of != Arc::as_ptr(&p) {
+                        if !a.pv.dib.is_null() {
+                            DeleteObject(a.pv.dib as HGDIOBJ);
+                        }
+                        a.pv.dib = make_dib(&p);
+                        a.pv.dib_of = Arc::as_ptr(&p);
+                    }
+                    let (iw, ih) = ((img.right - img.left).max(1) as u32, (img.bottom - img.top).max(1) as u32);
+                    // 小图按原尺寸（1 个图片像素 = 1 个屏幕像素）；大图已按框解码，框变小时临时拉伸
+                    let (dw, dh) = if p.w <= iw && p.h <= ih { (p.w, p.h) } else { picture::fit(p.w, p.h, iw, ih, false) };
+                    let x = img.left + (iw as i32 - dw as i32) / 2;
+                    let y = img.top + (ih as i32 - dh as i32) / 2;
+                    let dst = RECT { left: x, top: y, right: x + dw as i32, bottom: y + dh as i32 };
+                    ensure_checker();
+                    SetBrushOrgEx(mdc, x, y, null_mut());
+                    FillRect(mdc, &dst, a.pv.checker);
+                    let frame = CreateSolidBrush(0xC8C8C8);
+                    FrameRect(mdc, &RECT { left: dst.left - 1, top: dst.top - 1, right: dst.right + 1, bottom: dst.bottom + 1 }, frame);
+                    DeleteObject(frame as HGDIOBJ);
+                    if !a.pv.dib.is_null() {
+                        let sdc = CreateCompatibleDC(mdc);
+                        let old = SelectObject(sdc, a.pv.dib as HGDIOBJ);
+                        let bf = BLENDFUNCTION { BlendOp: AC_SRC_OVER as u8, BlendFlags: 0, SourceConstantAlpha: 255, AlphaFormat: AC_SRC_ALPHA as u8 };
+                        GdiAlphaBlend(mdc, x, y, dw as i32, dh as i32, sdc, 0, 0, p.w as i32, p.h as i32, bf);
+                        SelectObject(sdc, old);
+                        DeleteDC(sdc);
+                    }
+                }
+            }
+            Some(t) => {
+                if !a.pv.icon.is_null() {
+                    let s = scale(48);
+                    let x = img.left + (img.right - img.left - s) / 2;
+                    let y = img.top + (img.bottom - img.top - s) / 2;
+                    DrawIconEx(mdc, x, y, a.pv.icon, s, s, 0, null_mut(), DI_NORMAL);
+                }
+                line2 = if t.dir {
+                    "文件夹".into()
+                } else {
+                    match ext_upper(&t.name) {
+                        e if e.is_empty() => "文件".into(),
+                        e => format!("{e} 文件"),
+                    }
+                };
+            }
+        }
+
+        // 信息区：名称 / 尺寸格式 / 透明与缩放 / 大小时间 / 所在目录
+        if let Some(t) = &a.pv.target {
+            let one = DT_SINGLELINE | DT_END_ELLIPSIS;
+            let lh = a.pv.line_h;
+            let mut y = info.top;
+            let row = |y: i32, hgt: i32| RECT { left: info.left, top: y, right: info.right, bottom: y + hgt };
+            draw_text(mdc, &t.name, &row(y, a.pv.big_h), one, text, a.font_big);
+            y += a.pv.big_h + scale(4);
+            draw_text(mdc, &line2, &row(y, lh), one, text, a.font);
+            y += lh;
+            if !line3.is_empty() {
+                draw_text(mdc, &line3, &row(y, lh), one, gray, a.font);
+                y += lh;
+            }
+            let mut v = Vec::new();
+            if !t.dir {
+                v.push(format_size_kb(t.size));
+            }
+            v.push(format_filetime(t.mtime));
+            draw_text(mdc, &v.join(" · "), &row(y, lh), one, gray, a.font);
+            y += lh + scale(4);
+            draw_text(mdc, &parent_dir(&t.path), &RECT { left: info.left, top: y, right: info.right, bottom: info.bottom }, DT_WORDBREAK | DT_EDITCONTROL, gray, a.font);
+        }
+
+        BitBlt(hdc, 0, 0, w, hh, mdc, 0, 0, SRCCOPY);
+        SelectObject(mdc, old_font);
+        SelectObject(mdc, old_bm);
+        DeleteObject(mbm as HGDIOBJ);
+        DeleteDC(mdc);
+        EndPaint(h, &ps);
+    }
+}
+
+unsafe extern "system" fn pv_proc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    unsafe {
+        match msg {
+            WM_PAINT => {
+                pv_paint(h);
+                return 0;
+            }
+            WM_ERASEBKGND => return 1,
+            WM_SIZE => {
+                InvalidateRect(h, null(), 0);
+            }
+            WM_LBUTTONDBLCLK => {
+                if let Some(t) = app().pv.target.clone() {
+                    open_paths(&[t.path]);
+                }
+                return 0;
+            }
+            WM_RBUTTONUP => {
+                context_menu();
+                return 0;
+            }
+            _ => {}
+        }
+        DefWindowProcW(h, msg, wp, lp)
     }
 }
 
@@ -1222,7 +1951,8 @@ fn on_command(id: usize) {
         IDM_ABOUT => {
             let ix = a.engine.index.read().unwrap();
             let s = format!(
-                "anything 0.1.0\n无需管理员权限的本地文件名搜索\n\n已索引 {} 个对象\n索引内存约 {:.0} MB\n数据目录：{}",
+                "anything {}\n无需管理员权限的本地文件名搜索\n\n已索引 {} 个对象\n索引内存约 {:.0} MB\n数据目录：{}",
+                env!("CARGO_PKG_VERSION"),
                 group_digits(ix.alive() as u64),
                 ix.mem_bytes() as f64 / 1048576.0,
                 config::data_dir().display()
@@ -1230,6 +1960,7 @@ fn on_command(id: usize) {
             drop(ix);
             message_box(&s, "关于 anything", MB_ICONINFORMATION);
         }
+        IDM_PREVIEW => pv_toggle(),
         IDT_SHOW => show_main(),
         _ => {}
     }

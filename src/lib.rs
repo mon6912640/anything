@@ -4,6 +4,7 @@ pub mod config;
 pub mod engine;
 pub mod index;
 pub mod ipc;
+pub mod picture;
 pub mod query;
 pub mod scan;
 pub mod store;
