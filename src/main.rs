@@ -54,6 +54,7 @@ const IDM_RESCAN: usize = 1001;
 const IDM_SETTINGS: usize = 1002;
 const IDM_RELOAD: usize = 1003;
 const IDM_AUTOSTART: usize = 1004;
+const IDM_CTXMENU: usize = 1007;
 const IDM_DATADIR: usize = 1005;
 const IDM_EXIT: usize = 1006;
 const IDM_HELP: usize = 1010;
@@ -74,6 +75,12 @@ const IDT_EXIT: usize = 3003;
 
 const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 const RUN_VALUE: &str = "anything";
+
+const CTXMENU_DIR:     &str = r"Software\Classes\Directory\shell\anything";
+const CTXMENU_DIR_CMD: &str = r"Software\Classes\Directory\shell\anything\command";
+const CTXMENU_BG:      &str = r"Software\Classes\Directory\Background\shell\anything";
+const CTXMENU_BG_CMD:  &str = r"Software\Classes\Directory\Background\shell\anything\command";
+const COPYDATA_PATH: usize = 0x616E7974;
 
 const IID_IDATAOBJECT: GUID = GUID::from_u128(0x0000010e_0000_0000_c000_000000000046);
 
@@ -282,13 +289,27 @@ fn message_box(text: &str, title: &str, flags: u32) -> i32 {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let start_hidden = args.iter().any(|a| a.eq_ignore_ascii_case("/min") || a.eq_ignore_ascii_case("--min"));
+    let init_path: Option<String> = args.windows(2)
+        .find(|w| w[0].eq_ignore_ascii_case("--path"))
+        .map(|w| w[1].clone());
     unsafe {
-        // 单实例：已在运行则唤出已有窗口
         let _mutex = CreateMutexW(null(), 1, wide(r"Local\anything-single-instance").as_ptr());
         if GetLastError() == ERROR_ALREADY_EXISTS {
             let h = FindWindowW(wide(CLASS).as_ptr(), null());
             if !h.is_null() && !start_hidden {
-                PostMessageW(h, WM_APP_SHOW, 0, 0);
+                if let Some(ref path) = init_path {
+                    let p = path.trim_end_matches(['\\', '/']);
+                    let query = format!("path:{p}\\ ");
+                    let mut buf: Vec<u16> = query.encode_utf16().collect();
+                    let cds = COPYDATASTRUCT {
+                        dwData: COPYDATA_PATH,
+                        cbData: (buf.len() * 2) as u32,
+                        lpData: buf.as_mut_ptr() as *mut c_void,
+                    };
+                    SendMessageW(h, WM_COPYDATA, 0, &cds as *const COPYDATASTRUCT as isize);
+                } else {
+                    PostMessageW(h, WM_APP_SHOW, 0, 0);
+                }
             }
             return;
         }
@@ -432,6 +453,15 @@ fn main() {
             UpdateWindow(hwnd);
             SetFocus(app().edit);
         }
+        if let Some(ref path) = init_path {
+            let p = path.trim_end_matches(['\\', '/']);
+            let query = format!("path:{p}\\ ");
+            SetWindowTextW(app().edit, wide(&query).as_ptr());
+            start_search(false);
+            if start_hidden { show_main(); }
+            let n = GetWindowTextLengthW(app().edit);
+            send(app().edit, EM_SETSEL, n as usize, n as isize);
+        }
         SetTimer(hwnd, TIMER_UI, 500, None);
 
         let mut msg: MSG = std::mem::zeroed();
@@ -453,11 +483,15 @@ unsafe fn build_menu() -> HMENU {
         add(file, IDM_SETTINGS, "编辑设置文件(&S)…");
         add(file, IDM_RELOAD, "重新加载设置并重建索引(&L)");
         add(file, IDM_AUTOSTART, "开机自动启动(&A)");
+        add(file, IDM_CTXMENU, "资源管理器右键菜单(&E)");
         add(file, IDM_DATADIR, "打开数据目录(&D)");
         AppendMenuW(file, MF_SEPARATOR, 0, null());
         add(file, IDM_EXIT, "退出(&X)");
         if autostart_get() {
             CheckMenuItem(file, IDM_AUTOSTART as u32, MF_CHECKED);
+        }
+        if ctxmenu_get() {
+            CheckMenuItem(file, IDM_CTXMENU as u32, MF_CHECKED);
         }
         let view = CreatePopupMenu();
         add(view, IDM_PREVIEW, "图片预览面板(&P)\tF3");
@@ -616,6 +650,20 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     ui_save();
                 }
                 return 0;
+            }
+            WM_COPYDATA => {
+                let cds = &*(lp as *const COPYDATASTRUCT);
+                if cds.dwData == COPYDATA_PATH && cds.cbData > 0 {
+                    let len = cds.cbData as usize / 2;
+                    let slice = std::slice::from_raw_parts(cds.lpData as *const u16, len);
+                    let query = String::from_utf16_lossy(slice);
+                    SetWindowTextW(a.edit, wide(&query).as_ptr());
+                    show_main();
+                    start_search(false);
+                    let n = GetWindowTextLengthW(a.edit);
+                    send(a.edit, EM_SETSEL, n as usize, n as isize);
+                }
+                return 1;
             }
             WM_APP_SHOW => {
                 show_main();
@@ -1935,6 +1983,14 @@ fn on_command(id: usize) {
                 CheckMenuItem(file, IDM_AUTOSTART as u32, if autostart_get() { MF_CHECKED } else { MF_UNCHECKED });
             }
         }
+        IDM_CTXMENU => {
+            let on = !ctxmenu_get();
+            ctxmenu_set(on);
+            unsafe {
+                let file = GetSubMenu(a.menu, 0);
+                CheckMenuItem(file, IDM_CTXMENU as u32, if ctxmenu_get() { MF_CHECKED } else { MF_UNCHECKED });
+            }
+        }
         IDM_DATADIR => unsafe {
             ShellExecuteW(a.hwnd, wide("open").as_ptr(), wide(&config::data_dir().display().to_string()).as_ptr(), null(), null(), SW_SHOWNORMAL);
         },
@@ -1972,7 +2028,8 @@ fn show_main() {
         ShowWindow(a.hwnd, if IsIconic(a.hwnd) != 0 { SW_RESTORE } else { SW_SHOW });
         SetForegroundWindow(a.hwnd);
         SetFocus(a.edit);
-        send(a.edit, EM_SETSEL, 0, -1);
+        let n = GetWindowTextLengthW(a.edit);
+        if n == 0 { send(a.edit, EM_SETSEL, 0, -1); } else { send(a.edit, EM_SETSEL, n as usize, n as isize); }
     }
     if a.refresh_wanted {
         start_search(true);
@@ -2108,6 +2165,54 @@ fn autostart_set(on: bool) {
             RegSetKeyValueW(HKEY_CURRENT_USER, wide(RUN_KEY).as_ptr(), wide(RUN_VALUE).as_ptr(), REG_SZ, v.as_ptr() as *const c_void, (v.len() * 2) as u32);
         } else {
             RegDeleteKeyValueW(HKEY_CURRENT_USER, wide(RUN_KEY).as_ptr(), wide(RUN_VALUE).as_ptr());
+        }
+    }
+}
+
+fn ctxmenu_get() -> bool {
+    unsafe {
+        let mut size = 0u32;
+        let key = wide(CTXMENU_DIR_CMD);
+        let val = wide("");
+        RegGetValueW(HKEY_CURRENT_USER, key.as_ptr(), val.as_ptr(), RRF_RT_REG_SZ, null_mut(), null_mut(), &mut size) == ERROR_SUCCESS
+    }
+}
+
+fn ctxmenu_set(on: bool) {
+    let exe = std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_default();
+    unsafe {
+        if on {
+            let label      = wide("在 anything 中搜索(&A)");
+            let icon_name  = wide("Icon");
+            let icon_val   = wide(&format!("\"{exe}\",0"));
+            let v_empty    = wide("");
+            let k1         = wide(CTXMENU_DIR);
+            RegSetKeyValueW(HKEY_CURRENT_USER, k1.as_ptr(), v_empty.as_ptr(),    REG_SZ, label.as_ptr()    as *const c_void, (label.len()    * 2) as u32);
+            RegSetKeyValueW(HKEY_CURRENT_USER, k1.as_ptr(), icon_name.as_ptr(),  REG_SZ, icon_val.as_ptr() as *const c_void, (icon_val.len() * 2) as u32);
+            let k2  = wide(CTXMENU_DIR_CMD);
+            let v2  = wide("");
+            let cmd = wide(&format!("\"{exe}\" --path \"%1\""));
+            RegSetKeyValueW(HKEY_CURRENT_USER, k2.as_ptr(), v2.as_ptr(), REG_SZ, cmd.as_ptr() as *const c_void, (cmd.len() * 2) as u32);
+            let k3         = wide(CTXMENU_BG);
+            let v3         = wide("");
+            let label3     = wide("在 anything 中搜索(&A)");
+            let icon_name3 = wide("Icon");
+            let icon_val3  = wide(&format!("\"{exe}\",0"));
+            RegSetKeyValueW(HKEY_CURRENT_USER, k3.as_ptr(), v3.as_ptr(),         REG_SZ, label3.as_ptr()     as *const c_void, (label3.len()     * 2) as u32);
+            RegSetKeyValueW(HKEY_CURRENT_USER, k3.as_ptr(), icon_name3.as_ptr(), REG_SZ, icon_val3.as_ptr()  as *const c_void, (icon_val3.len()  * 2) as u32);
+            let k4     = wide(CTXMENU_BG_CMD);
+            let v4     = wide("");
+            let bg_cmd = wide(&format!("\"{exe}\" --path \"%V\""));
+            RegSetKeyValueW(HKEY_CURRENT_USER, k4.as_ptr(), v4.as_ptr(), REG_SZ, bg_cmd.as_ptr() as *const c_void, (bg_cmd.len() * 2) as u32);
+        } else {
+            let k1 = wide(CTXMENU_DIR_CMD);
+            let k2 = wide(CTXMENU_DIR);
+            let k3 = wide(CTXMENU_BG_CMD);
+            let k4 = wide(CTXMENU_BG);
+            RegDeleteKeyW(HKEY_CURRENT_USER, k1.as_ptr());
+            RegDeleteKeyW(HKEY_CURRENT_USER, k2.as_ptr());
+            RegDeleteKeyW(HKEY_CURRENT_USER, k3.as_ptr());
+            RegDeleteKeyW(HKEY_CURRENT_USER, k4.as_ptr());
         }
     }
 }
