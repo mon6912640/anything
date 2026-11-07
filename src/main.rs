@@ -13,7 +13,7 @@ use anything::config::{self, Config};
 use anything::engine::{Engine, Hits, Notice};
 use anything::ipc;
 use anything::picture::{self, Kind, Picture};
-use anything::query::SortCol;
+use anything::query::{SortCol, dir_query};
 use anything::util::{format_filetime, format_size_kb, group_digits, wide};
 
 use windows_sys::Win32::Foundation::*;
@@ -287,12 +287,6 @@ fn message_box(text: &str, title: &str, flags: u32) -> i32 {
 
 // ---------------------------------------------------------------- 主程序
 
-/// 右键菜单/脚本传来的目录 -> 搜索框里的查询。under: 前缀把整个路径当字面量，
-/// 目录名里有空格、! 之类的字符也不会被当成搜索语法
-fn path_query(path: &str) -> String {
-    format!("\"under:{}\"", path.trim_end_matches(['\\', '/']))
-}
-
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let start_hidden = args.iter().any(|a| a.eq_ignore_ascii_case("/min") || a.eq_ignore_ascii_case("--min"));
@@ -305,7 +299,7 @@ fn main() {
             let h = FindWindowW(wide(CLASS).as_ptr(), null());
             if !h.is_null() && !start_hidden {
                 if let Some(ref path) = init_path {
-                    let query = path_query(path);
+                    let query = dir_query(path);
                     let mut buf: Vec<u16> = query.encode_utf16().collect();
                     let cds = COPYDATASTRUCT {
                         dwData: COPYDATA_PATH,
@@ -460,7 +454,7 @@ fn main() {
             SetFocus(app().edit);
         }
         if let Some(ref path) = init_path {
-            SetWindowTextW(app().edit, wide(&path_query(path)).as_ptr());
+            SetWindowTextW(app().edit, wide(&dir_query(path)).as_ptr());
             start_search(false);
             if start_hidden { show_main(); }
             let n = GetWindowTextLengthW(app().edit);

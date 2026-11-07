@@ -295,7 +295,21 @@ impl Query {
         q.terms.sort_by_key(|t| t.path);
         Ok(q)
     }
+}
 
+/// 把目录路径拼成搜索框里的查询词：`under:<目录>`。
+/// 目录名含空白时用引号包住，保证整个路径是一个词；末尾留一个空格，
+/// 插入搜索框后继续输入的关键词不会和它粘成一个词。
+pub fn dir_query(dir: &str) -> String {
+    let dir = dir.trim_end_matches(['\\', '/']);
+    if dir.chars().any(char::is_whitespace) {
+        format!("\"under:{dir}\" ")
+    } else {
+        format!("under:{dir} ")
+    }
+}
+
+impl Query {
     pub fn is_match_all(&self) -> bool {
         self.terms.is_empty()
             && self.exts.is_none()
@@ -710,5 +724,24 @@ mod parse_tests {
         // 通配符不参与解释：C:\Al* 不是前缀匹配
         let q = Query::parse(r"under:C:\Al*", false).unwrap();
         assert!(search(&ix, &q, &|| false).unwrap().is_empty());
+    }
+
+    #[test]
+    fn dir_query_for_search_box() {
+        // 不带空格：不加引号，末尾留一个空格
+        assert_eq!(dir_query(r"D:\Work\"), "under:D:\\Work ");
+        // 含空格：整体加引号，仍是一个词
+        assert_eq!(dir_query(r"C:\My Docs"), "\"under:C:\\My Docs\" ");
+        // 末尾的空格让后续输入的关键词是独立的词
+        let q = Query::parse(&format!("{}png", dir_query(r"C:\My Docs")), false).unwrap();
+        assert_eq!(q.terms.len(), 2);
+        match &q.terms.iter().find(|t| t.path).unwrap().alts[0] {
+            Pat::Sub(f) => assert_eq!(f.needle(), b"c:\\my docs\\"),
+            _ => panic!("under: 应该解析成普通子串匹配"),
+        }
+        // 少了这个空格就会粘成一个词（之前搜不出来的原因）
+        let q = Query::parse("\"under:C:\\My Docs\"png", false).unwrap();
+        assert_eq!(q.terms.len(), 1);
+        assert!(q.terms[0].path);
     }
 }
