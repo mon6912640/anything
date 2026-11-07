@@ -93,6 +93,7 @@ const HELP_TEXT: &str = "搜索语法（与 Everything 接近）：
   xmwj             拼音首字母，可搜到“项目文件”
   work\\  \\src\\ *.rs   含 \\ 的词在完整路径中匹配
   path:abc         在完整路径中匹配
+  under:D:\\Work    只搜这个目录下面（路径整体当字面量）
   regex:^a.*\\.rs$   正则表达式
   ext:png;jpg      按扩展名
   file:  folder:   只要文件 / 只要文件夹
@@ -286,6 +287,12 @@ fn message_box(text: &str, title: &str, flags: u32) -> i32 {
 
 // ---------------------------------------------------------------- 主程序
 
+/// 右键菜单/脚本传来的目录 -> 搜索框里的查询。under: 前缀把整个路径当字面量，
+/// 目录名里有空格、! 之类的字符也不会被当成搜索语法
+fn path_query(path: &str) -> String {
+    format!("\"under:{}\"", path.trim_end_matches(['\\', '/']))
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let start_hidden = args.iter().any(|a| a.eq_ignore_ascii_case("/min") || a.eq_ignore_ascii_case("--min"));
@@ -298,8 +305,7 @@ fn main() {
             let h = FindWindowW(wide(CLASS).as_ptr(), null());
             if !h.is_null() && !start_hidden {
                 if let Some(ref path) = init_path {
-                    let p = path.trim_end_matches(['\\', '/']);
-                    let query = format!("path:{p}\\ ");
+                    let query = path_query(path);
                     let mut buf: Vec<u16> = query.encode_utf16().collect();
                     let cds = COPYDATASTRUCT {
                         dwData: COPYDATA_PATH,
@@ -454,9 +460,7 @@ fn main() {
             SetFocus(app().edit);
         }
         if let Some(ref path) = init_path {
-            let p = path.trim_end_matches(['\\', '/']);
-            let query = format!("path:{p}\\ ");
-            SetWindowTextW(app().edit, wide(&query).as_ptr());
+            SetWindowTextW(app().edit, wide(&path_query(path)).as_ptr());
             start_search(false);
             if start_hidden { show_main(); }
             let n = GetWindowTextLengthW(app().edit);

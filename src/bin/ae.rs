@@ -121,7 +121,7 @@ fn parse_args() -> Result<Opts, String> {
             "sort-date" | "sort-dm" => o.req.sort = SortCol::Date,
             "desc" | "sort-descending" => o.req.desc = true,
             "asc" | "sort-ascending" => o.req.desc = false,
-            "path" | "p" => terms.push(format!("\"path:{}\\\"", val(&a)?.trim_end_matches('\\'))),
+            "path" | "p" => terms.push(format!("\"under:{}\"", val(&a)?.trim_end_matches(['\\', '/']))),
             "regex" | "r" => terms.push(format!("\"regex:{}\"", val(&a)?)),
             "count" | "get-result-count" => o.count = true,
             "size" => o.size = true,

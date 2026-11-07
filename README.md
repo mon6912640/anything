@@ -37,6 +37,7 @@
 | `xmwj` | 拼音首字母，可搜到“项目文件” |
 | `work\`　`\src\ *.rs` | 含 `\` 的词在完整路径中匹配 |
 | `path:abc` | 在完整路径中匹配 |
+| `under:D:\Work` | 只搜这个目录下面（路径整体当字面量，可含空格等特殊字符） |
 | `regex:^a.*\.rs$` | 正则表达式（`regex:path:...` 匹配完整路径） |
 | `ext:png;jpg` | 按扩展名 |
 | `file:`　`folder:` | 只要文件 / 只要文件夹 |
@@ -58,6 +59,23 @@
 | `F1` | 帮助 |
 
 点列标题可按名称、路径、大小、修改时间排序；结果可以直接拖到资源管理器或其他程序。关闭窗口只是隐藏到托盘，退出请用托盘菜单或“文件 → 退出”。
+
+## 资源管理器右键菜单
+
+菜单“文件 → 资源管理器右键菜单”勾选后，在资源管理器里右键文件夹、或在文件夹空白处点右键，会多出一项“在 anything 中搜索”，直接搜索这个目录下的内容。
+
+- 只写当前用户的注册表（`HKCU\Software\Classes\Directory\shell\anything` 和 `...\Directory\Background\shell\anything`），不需要管理员权限，也不改系统全局设置
+- 再点一次取消勾选，会删掉这两处注册表项
+- 命令里记的是当前 exe 的完整路径，把程序挪了位置（比如便携版换个目录）之后重新勾选一次即可
+
+## 启动参数（anything.exe）
+
+```
+anything.exe --path D:\Work    直接搜索这个目录（右键菜单就是这么调用的）
+anything.exe /min              启动后隐藏到托盘
+```
+
+`--path` 把整个目录路径当字面量，目录名里带空格、`!` 之类的字符也不会被当成搜索语法。已经在运行时，新的一次调用会把目录交给已有窗口，不会再开一个实例。
 
 ## 图片预览
 
@@ -152,6 +170,12 @@ pinyin=1               ; 拼音首字母搜索
 ## 编译
 
 需要 Rust（stable，`x86_64-pc-windows-msvc` 目标）和 VS Build Tools（含 Windows SDK）。
+
+图标、manifest、版本信息由 `build.rs` 调用 Windows SDK 的 `rc.exe` 编进 exe，**找不到 `rc.exe` 会直接编译失败**——避免发出没有图标、没有版本号的包。SDK 不在默认位置时用环境变量指定：
+
+```
+set RC_EXE=C:\Program Files (x86)\Windows Kits\10\bin\10.0.22621.0\x64\rc.exe
+```
 
 ```
 cargo build --release

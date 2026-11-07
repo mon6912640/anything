@@ -7,6 +7,7 @@
 //!   *.psd  a?c     通配符，匹配完整文件名
 //!   含 \ 的词       在完整路径中匹配，如 work\ 或 \src\*.rs
 //!   path:abc       在完整路径中匹配
+//!   under:C:\dir   只搜该目录之下（整个路径当字面量，不解释通配符和 |）
 //!   regex:^a.*\.rs$  正则（匹配文件名；regex:path:... 匹配完整路径）
 //!   ext:png;jpg    扩展名
 //!   file: folder:  只要文件 / 只要文件夹
@@ -234,6 +235,16 @@ impl Query {
             }
             if lower == "folder:" || lower == "dir:" || lower == "folders:" {
                 q.dirs_only = true;
+                continue;
+            }
+            if let Some(v) = strip_prefix_ci(t, "under:") {
+                // 目录前缀：路径整体当字面量，含 | * ? 也不当成搜索语法
+                let dir = v.trim_end_matches(['\\', '/']);
+                if !dir.is_empty() {
+                    let mut f = fold(dir);
+                    f.push(b'\\');
+                    q.terms.push(Term { neg, path: true, alts: vec![Pat::Sub(Finder::new(&f).into_owned())], py: false });
+                }
                 continue;
             }
             if let Some(v) = strip_prefix_ci(t, "ext:") {
@@ -661,5 +672,43 @@ mod parse_tests {
         assert!(q.terms.iter().any(|t| t.alts.len() == 2));
         assert!(Query::parse("dm:today dm:2026-01..2026-06", false).is_ok());
         assert!(Query::parse("regex:(", false).is_err());
+    }
+
+    #[test]
+    fn under_prefix() {
+        // 路径里的 | * ? 空格都当字面量
+        let q = Query::parse(r#"under:C:\a|b* "under:C:\My Docs" !under:D:\skip"#, true).unwrap();
+        assert_eq!(q.terms.len(), 3);
+        let needle = |t: &Term| match &t.alts[0] {
+            Pat::Sub(f) => f.needle().to_vec(),
+            _ => panic!("under: 应该解析成普通子串匹配"),
+        };
+        assert_eq!(needle(&q.terms[0]), b"c:\\a|b*\\".to_vec());
+        assert_eq!(needle(&q.terms[1]), b"c:\\my docs\\".to_vec());
+        assert_eq!(needle(&q.terms[2]), b"d:\\skip\\".to_vec());
+        assert!(q.terms[2].neg);
+        assert!(q.terms.iter().all(|t| t.path && t.alts.len() == 1));
+        // 尾部反斜杠可有可无，盘符根也行
+        let q = Query::parse(r"under:D:\", false).unwrap();
+        assert_eq!(needle(&q.terms[0]), b"d:\\".to_vec());
+    }
+
+    #[test]
+    fn under_filters() {
+        use crate::index::{F_DIR, Index, NONE};
+        let mut ix = Index::new();
+        let root = ix.push("C:", b"c:", None, NONE, F_DIR, 0, 0);
+        let a = ix.push("Alpha", b"alpha", None, root, F_DIR, 0, 0);
+        let b = ix.push("Beta", b"beta", None, root, F_DIR, 0, 0);
+        ix.push("a.txt", b"a.txt", None, a, 0, 10, 0);
+        ix.push("b.txt", b"b.txt", None, b, 0, 20, 0);
+        ix.rebuild_map();
+        let q = Query::parse(r"under:C:\Alpha", false).unwrap();
+        let ids = search(&ix, &q, &|| false).unwrap();
+        assert_eq!(ids.len(), 1);
+        assert_eq!(ix.name(ids[0]), "a.txt");
+        // 通配符不参与解释：C:\Al* 不是前缀匹配
+        let q = Query::parse(r"under:C:\Al*", false).unwrap();
+        assert!(search(&ix, &q, &|| false).unwrap().is_empty());
     }
 }
