@@ -258,6 +258,15 @@ fn get_text(h: HWND) -> String {
     }
 }
 
+/// 写入查询后把插入点放到末尾，便于继续输入关键词。
+fn set_search_text(edit: HWND, query: &str) {
+    unsafe {
+        SetWindowTextW(edit, wide(query).as_ptr());
+        let n = GetWindowTextLengthW(edit);
+        send(edit, EM_SETSEL, n as usize, n as isize);
+    }
+}
+
 fn make_font(pt: i32, dpi: u32) -> HFONT {
     let face = wide("Microsoft YaHei UI");
     unsafe {
@@ -454,11 +463,9 @@ fn main() {
             SetFocus(app().edit);
         }
         if let Some(ref path) = init_path {
-            SetWindowTextW(app().edit, wide(&dir_query(path)).as_ptr());
+            set_search_text(app().edit, &dir_query(path));
             start_search(false);
             if start_hidden { show_main(); }
-            let n = GetWindowTextLengthW(app().edit);
-            send(app().edit, EM_SETSEL, n as usize, n as isize);
         }
         SetTimer(hwnd, TIMER_UI, 500, None);
 
@@ -655,11 +662,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     let len = cds.cbData as usize / 2;
                     let slice = std::slice::from_raw_parts(cds.lpData as *const u16, len);
                     let query = String::from_utf16_lossy(slice);
-                    SetWindowTextW(a.edit, wide(&query).as_ptr());
+                    set_search_text(a.edit, &query);
                     show_main();
                     start_search(false);
-                    let n = GetWindowTextLengthW(a.edit);
-                    send(a.edit, EM_SETSEL, n as usize, n as isize);
                 }
                 return 1;
             }
@@ -1285,6 +1290,22 @@ fn update_sort_arrows() {
     }
 }
 
+fn list_custom_draw(draw: &mut NMLVCUSTOMDRAW) -> LRESULT {
+    match draw.nmcd.dwDrawStage {
+        CDDS_PREPAINT => return CDRF_NOTIFYITEMDRAW as LRESULT,
+        CDDS_ITEMPREPAINT => {
+            // 按显示行号交替背景；选中高亮、焦点框仍由系统绘制。
+            draw.clrTextBk = if draw.nmcd.dwItemSpec % 2 == 0 {
+                unsafe { GetSysColor(COLOR_WINDOW) }
+            } else {
+                0x00F5F5F5
+            };
+        }
+        _ => {}
+    }
+    CDRF_DODEFAULT as LRESULT
+}
+
 fn on_notify(h: &NMHDR, lp: LPARAM) -> LRESULT {
     let a = app();
     if h.hwndFrom != a.list {
@@ -1292,6 +1313,9 @@ fn on_notify(h: &NMHDR, lp: LPARAM) -> LRESULT {
     }
     unsafe {
         match h.code {
+            NM_CUSTOMDRAW => {
+                return list_custom_draw(&mut *(lp as *mut NMLVCUSTOMDRAW));
+            }
             LVN_GETDISPINFOW => on_dispinfo(&mut *(lp as *mut NMLVDISPINFOW)),
             NM_DBLCLK => activate(ctrl_down()),
             NM_RETURN => activate(ctrl_down()),
@@ -1338,6 +1362,10 @@ fn on_notify(h: &NMHDR, lp: LPARAM) -> LRESULT {
     }
     0
 }
+
+#[cfg(test)]
+#[path = "ui_tests.rs"]
+mod ui_tests;
 
 // ---------------------------------------------------------------- 搜索框
 

@@ -1,6 +1,6 @@
 [package]
 name = "anything"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2024"
 description = "无需管理员权限的本地文件名极速搜索（类 Everything）"
 
