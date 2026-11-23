@@ -185,6 +185,54 @@ fn native_list_stripes_selection_scroll_and_refresh() {
 }
 
 #[test]
+fn empty_queries_never_start_a_search() {
+    for text in ["", "  \t ", "\"\"", "path:", "under:", "regex:"] {
+        assert!(is_empty_query(text, true), "应按空查询处理：{text:?}");
+    }
+    for text in ["needle", "file:", "folder:", "ext:rs", "under:C:\\", "regex:("] {
+        assert!(!is_empty_query(text, true), "不是空查询：{text:?}");
+    }
+}
+
+#[test]
+fn selection_restore_is_computed_from_result_ids() {
+    let old = Selection {
+        clear_rows: vec![1, 2, 3],
+        focus: Some(20),
+        selected: HashSet::from([10, 20, 30]),
+    };
+    let restored = restore_selection(&[5, 30, 20, 10], &old);
+    assert_eq!(restored, vec![
+        (1, LVIS_SELECTED),
+        (2, LVIS_SELECTED | LVIS_FOCUSED),
+        (3, LVIS_SELECTED),
+    ]);
+}
+
+#[test]
+fn native_virtual_list_reset_clears_selection_without_all_item_state() {
+    let parent = TestWindow::new();
+    let list = parent.control(WC_LISTVIEWW, LVS_REPORT | LVS_OWNERDATA | LVS_SHOWSELALWAYS);
+    const N: usize = 1_000_000;
+    unsafe {
+        send(list, LVM_SETITEMCOUNT, N, 0);
+        for row in [1, 999_999] {
+            let item = LVITEMW { stateMask: LVIS_SELECTED, state: LVIS_SELECTED, ..std::mem::zeroed() };
+            send(list, LVM_SETITEMSTATE, row, &item as *const _ as isize);
+        }
+        let focus = LVITEMW { stateMask: LVIS_FOCUSED, state: LVIS_FOCUSED, ..std::mem::zeroed() };
+        send(list, LVM_SETITEMSTATE, 2, &focus as *const _ as isize);
+        assert_eq!(send(list, LVM_GETSELECTEDCOUNT, 0, 0), 2);
+
+        reset_list(list, N);
+
+        assert_eq!(send(list, LVM_GETITEMCOUNT, 0, 0), N as isize);
+        assert_eq!(send(list, LVM_GETSELECTEDCOUNT, 0, 0), 0);
+        assert_eq!(send(list, LVM_GETNEXTITEM, usize::MAX, LVNI_FOCUSED as isize), -1);
+    }
+}
+
+#[test]
 fn native_edit_directory_query_then_type_and_search() {
     let parent = TestWindow::new();
     let edit = parent.control(windows_sys::core::w!("EDIT"), ES_AUTOHSCROLL as u32);
@@ -241,6 +289,12 @@ fn executable_path_cold_start_and_existing_instance() {
             let mut text = vec![0u16; length + 1];
             let got = send(edit, WM_GETTEXT, text.len(), text.as_mut_ptr() as isize).max(0) as usize;
             String::from_utf16_lossy(&text[..got])
+        }
+    }
+    fn replace_text(edit: HWND, text: &str) {
+        unsafe {
+            send(edit, EM_SETSEL, 0, -1);
+            send(edit, EM_REPLACESEL, 1, wide(text).as_ptr() as isize);
         }
     }
     fn append_and_check(edit: HWND, list: HWND, directory: &str, initial_count: isize) {
@@ -322,5 +376,43 @@ fn executable_path_cold_start_and_existing_instance() {
         assert_eq!(FindWindowW(wide(CLASS).as_ptr(), null()), window);
         append_and_check(edit, list, second.to_str().unwrap(), 3);
         println!("existing-instance --path: separator, caret and search results passed");
+
+        // 搜索成功后手动清空：应立即得到空列表，进程继续响应。
+        replace_text(edit, "");
+        wait_until(|| send(list, LVM_GETITEMCOUNT, 0, 0) == 0);
+        assert!(running.0.try_wait().unwrap().is_none());
+        println!("clear-after-search: empty results without a background match-all passed");
+
+        // 正常退出以保存索引，再以空搜索框启动。索引加载完成通知不能触发全量搜索。
+        PostMessageW(window, WM_COMMAND, IDM_EXIT, 0);
+        wait_until(|| running.0.try_wait().unwrap().is_some());
+        assert!(running.0.wait().unwrap().success());
+        running.0 = Command::new(&executable).env("ANYTHING_DATA_DIR", &data).spawn().unwrap();
+        window = null_mut();
+        wait_until(|| {
+            assert!(running.0.try_wait().unwrap().is_none(), "application exited after restart");
+            window = FindWindowW(wide(CLASS).as_ptr(), null());
+            !window.is_null()
+        });
+        let mut process_id = 0;
+        GetWindowThreadProcessId(window, &mut process_id);
+        assert_eq!(process_id, running.0.id());
+        wait_until(|| {
+            edit = FindWindowExW(window, null_mut(), windows_sys::core::w!("Edit"), null());
+            list = FindWindowExW(window, null_mut(), WC_LISTVIEWW, null());
+            !edit.is_null() && !list.is_null()
+        });
+        let ae = std::path::Path::new(&executable).parent().unwrap().join("ae.exe");
+        wait_until(|| {
+            let out = Command::new(&ae).arg("-status").env("ANYTHING_DATA_DIR", &data).output().unwrap();
+            String::from_utf8_lossy(&out.stdout).contains("已索引 8 个对象")
+        });
+        assert_eq!(send(list, LVM_GETITEMCOUNT, 0, 0), 0);
+        replace_text(edit, "needle");
+        wait_until(|| send(list, LVM_GETITEMCOUNT, 0, 0) == 2);
+        replace_text(edit, "");
+        wait_until(|| send(list, LVM_GETITEMCOUNT, 0, 0) == 0);
+        assert!(running.0.try_wait().unwrap().is_none());
+        println!("restart-with-saved-index: no automatic empty search; search and clear still work");
     }
 }

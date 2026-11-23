@@ -137,6 +137,17 @@ struct Pending {
     seq: u64,
     keep: bool,
     res: Result<Hits, String>,
+    /// 旧列表中需要清除选择/焦点的行，只处理这些行，不对全部结果发状态消息。
+    clear_rows: Vec<usize>,
+    /// 后台算好的新选择/焦点位置，避免在 UI 线程遍历全部结果。
+    restore: Vec<(usize, u32)>,
+}
+
+/// 发起搜索时保存的选择状态；新结果返回后在后台计算对应的新位置。
+struct Selection {
+    clear_rows: Vec<usize>,
+    focus: Option<u32>,
+    selected: HashSet<u32>,
 }
 
 /// 预览面板正在显示的条目
@@ -835,17 +846,90 @@ unsafe fn layout() {
 
 // ---------------------------------------------------------------- 搜索
 
+/// 没有任何有效条件的查询在界面上直接显示空结果。
+/// 只改变 UI 行为；ae 等调用方仍可用无条件查询枚举整个索引。
+fn is_empty_query(text: &str, pinyin: bool) -> bool {
+    anything::query::Query::parse(text, pinyin).is_ok_and(|q| q.is_match_all())
+}
+
+/// 新查询替换结果时先把虚拟列表清零，由控件丢弃旧选择和焦点。
+/// 不要对全部新结果发送 LVM_SETITEMSTATE(-1)。
+fn reset_list(list: HWND, n: usize) {
+    unsafe {
+        send(list, LVM_SETITEMCOUNT, 0, 0);
+        send(list, LVM_SETITEMCOUNT, n, 0);
+    }
+}
+
+fn clear_results() {
+    let a = app();
+    a.results.clear();
+    a.res_gen = a.engine.generation.load(SeqCst);
+    a.file_icons.clear();
+    a.count_text = "输入关键词开始搜索".into();
+    unsafe {
+        reset_list(a.list, 0);
+        InvalidateRect(a.list, null(), 0);
+        let t = wide(&a.count_text);
+        send(a.status, SB_SETTEXTW, 0, t.as_ptr() as isize);
+    }
+    pv_clear();
+    unsafe { InvalidateRect(a.pv.hwnd, null(), 0) };
+}
+
+fn selection_snapshot() -> Selection {
+    let a = app();
+    let rows = selected_rows();
+    let selected: HashSet<u32> = rows.iter().filter(|&&r| r < a.results.len()).map(|&r| a.results[r]).collect();
+    let f = unsafe { focused_index() };
+    let focus = if f >= 0 && (f as usize) < a.results.len() { Some(a.results[f as usize]) } else { None };
+    let mut clear_rows = rows;
+    if f >= 0 {
+        clear_rows.push(f as usize);
+    }
+    clear_rows.sort_unstable();
+    clear_rows.dedup();
+    Selection { clear_rows, focus, selected }
+}
+
+fn restore_selection(ids: &[u32], old: &Selection) -> Vec<(usize, u32)> {
+    if old.focus.is_none() && old.selected.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for (pos, id) in ids.iter().enumerate() {
+        let mut state = 0;
+        if old.selected.contains(id) {
+            state |= LVIS_SELECTED;
+        }
+        if old.focus == Some(*id) {
+            state |= LVIS_FOCUSED;
+        }
+        if state != 0 {
+            out.push((pos, state));
+        }
+    }
+    out
+}
+
 fn start_search(keep: bool) {
     let a = app();
     let text = get_text(a.edit);
+    // 先作废旧查询，再处理空查询，防止旧的全量结果随后返回。
     let seq = a.seq.fetch_add(1, SeqCst) + 1;
+    a.last_changes = a.engine.changes.load(SeqCst);
+    a.refresh_wanted = false;
+    if is_empty_query(&text, a.engine.cfg().pinyin) {
+        a.pending.lock().unwrap().take();
+        clear_results();
+        return;
+    }
+    let selection = if keep { selection_snapshot() } else { Selection { clear_rows: Vec::new(), focus: None, selected: HashSet::new() } };
     let engine = a.engine.clone();
     let seqa = a.seq.clone();
     let pending = a.pending.clone();
     let hwnd = a.hwnd as isize;
     let (col, desc) = (a.sort_col, a.sort_desc);
-    a.last_changes = a.engine.changes.load(SeqCst);
-    a.refresh_wanted = false;
     std::thread::spawn(move || {
         let cancel = || seqa.load(SeqCst) != seq;
         let res = match engine.search(&text, col, desc, &cancel) {
@@ -856,7 +940,11 @@ fn start_search(keep: bool) {
         if cancel() {
             return;
         }
-        *pending.lock().unwrap() = Some(Pending { seq, keep, res });
+        let restore = match &res {
+            Ok(h) => restore_selection(&h.ids, &selection),
+            Err(_) => Vec::new(),
+        };
+        *pending.lock().unwrap() = Some(Pending { seq, keep, res, clear_rows: selection.clear_rows, restore });
         unsafe { PostMessageW(hwnd as HWND, WM_APP_RESULT, 0, 0) };
     });
 }
@@ -886,39 +974,25 @@ fn on_result() {
                 a.count_text = format!("搜索语法错误：{e}");
             }
             Ok(h) => {
-                // 刷新时按条目编号保留选中项和焦点项
-                let (old_focus, old_sel) = if p.keep {
-                    let f = focused_index();
-                    let focus = if f >= 0 && (f as usize) < a.results.len() { Some(a.results[f as usize]) } else { None };
-                    let sel: HashSet<u32> = selected_rows().into_iter().filter(|&r| r < a.results.len()).map(|r| a.results[r]).collect();
-                    (focus, sel)
-                } else {
-                    (None, HashSet::new())
-                };
                 a.results = h.ids;
                 a.res_gen = h.generation;
                 a.file_icons.clear();
                 let n = a.results.len();
                 if p.keep {
                     send(a.list, LVM_SETITEMCOUNT, n, (LVSICF_NOSCROLL | LVSICF_NOINVALIDATEALL) as isize);
-                    set_item_state(-1, 0, LVIS_SELECTED | LVIS_FOCUSED);
-                    if !old_sel.is_empty() || old_focus.is_some() {
-                        for (pos, id) in a.results.iter().enumerate() {
-                            let mut st = 0;
-                            if old_sel.contains(id) {
-                                st |= LVIS_SELECTED;
-                            }
-                            if old_focus == Some(*id) {
-                                st |= LVIS_FOCUSED;
-                            }
-                            if st != 0 {
-                                set_item_state(pos as i32, st, st);
-                            }
+                    // 只清理旧选择/焦点涉及的行；新位置已在搜索线程算好。
+                    for row in p.clear_rows {
+                        if row < n {
+                            set_item_state(row as i32, 0, LVIS_SELECTED | LVIS_FOCUSED);
+                        }
+                    }
+                    for (pos, state) in p.restore {
+                        if pos < n {
+                            set_item_state(pos as i32, state, state);
                         }
                     }
                 } else {
-                    send(a.list, LVM_SETITEMCOUNT, n, 0);
-                    set_item_state(-1, 0, LVIS_SELECTED | LVIS_FOCUSED);
+                    reset_list(a.list, n);
                     if n > 0 {
                         send(a.list, LVM_ENSUREVISIBLE, 0, 0);
                     }
