@@ -599,6 +599,35 @@ pub fn search(ix: &Index, q: &Query, cancel: &(dyn Fn() -> bool + Sync)) -> Opti
     if cancel() { None } else { Some(filtered) }
 }
 
+/// 大结果集沿有序视图扫描比给每个命中项建立排序键再排序更便宜。
+fn prefer_ordered_view(n: usize, matches: usize) -> bool {
+    matches > 1 && matches.saturating_mul(matches.ilog2() as usize + 1) >= n
+}
+
+/// 位图标记命中项，再按预计算顺序并行收集；结果为 O(n + m)，无需比较排序。
+fn collect_ordered(ids: &mut Vec<u32>, order: &[u32]) {
+    let mut marks = vec![0u64; order.len().div_ceil(64)];
+    for &id in ids.iter() {
+        let i = id as usize;
+        marks[i / 64] |= 1u64 << (i % 64);
+    }
+    const CH: usize = 1 << 15;
+    *ids = order
+        .par_chunks(CH)
+        .map(|chunk| {
+            chunk
+                .iter()
+                .copied()
+                .filter(|&id| {
+                    let i = id as usize;
+                    marks[i / 64] & (1u64 << (i % 64)) != 0
+                })
+                .collect::<Vec<u32>>()
+        })
+        .flatten_iter()
+        .collect();
+}
+
 /// 结果排序
 pub fn sort(ix: &Index, ids: &mut Vec<u32>, col: SortCol, desc: bool) {
     if ids.len() > 1 {
@@ -606,7 +635,10 @@ pub fn sort(ix: &Index, ids: &mut Vec<u32>, col: SortCol, desc: bool) {
             SortCol::None => {}
             SortCol::Name | SortCol::Path => {
                 let rank = if col == SortCol::Name { &ix.rank_name } else { &ix.rank_path };
-                if rank.is_empty() {
+                let order = if col == SortCol::Name { ix.name_order() } else { ix.path_order() };
+                if let Some(order) = order.filter(|o| prefer_ordered_view(o.len(), ids.len())) {
+                    collect_ordered(ids, order);
+                } else if rank.is_empty() {
                     // 名次还没算好（刚建完索引）：直接比较名字
                     ids.par_sort_unstable_by(|&a, &b| ix.folded_name(a).cmp(ix.folded_name(b)).then(a.cmp(&b)));
                 } else {
@@ -655,6 +687,89 @@ mod tests {
         assert!(glob_match("项?".as_bytes(), "项目".as_bytes()));
         assert!(glob_match(b"*", b""));
         assert!(!glob_match(b"*.rs", b"main.rsx"));
+    }
+
+    fn legacy_rank_sort(ix: &Index, ids: &mut Vec<u32>, col: SortCol, desc: bool) {
+        let rank = if col == SortCol::Name { &ix.rank_name } else { &ix.rank_path };
+        let rl = rank.len() as u32;
+        let mut keyed: Vec<u64> = ids
+            .iter()
+            .map(|&i| {
+                let r = if i < rl { rank[i as usize] } else { u32::MAX };
+                ((r as u64) << 32) | i as u64
+            })
+            .collect();
+        keyed.sort_unstable();
+        let tail = keyed.partition_point(|&k| (k >> 32) as u32 != u32::MAX);
+        for (d, k) in ids.iter_mut().zip(keyed.iter()) {
+            *d = *k as u32;
+        }
+        ids[tail..].sort_unstable_by(|&a, &b| ix.folded_name(a).cmp(ix.folded_name(b)));
+        if desc {
+            ids.reverse();
+        }
+    }
+
+    fn populated_index() -> Index {
+        let mut ix = Index::new();
+        let root = ix.push("C:", b"c:", None, NONE, F_DIR, 0, 0);
+        let mut dirs = vec![root];
+        for i in 0..16 {
+            let name = format!("dir{i:02}");
+            let parent = dirs[(i * 5 + 1) % dirs.len()];
+            let id = ix.push(&name, &fold(&name), None, parent, F_DIR, 0, 0);
+            dirs.push(id);
+        }
+        for i in 0..1024 {
+            let name = format!("file{:04}-{}.txt", (i * 37) % 1024, i % 11);
+            let parent = dirs[(i * 7 + 3) % dirs.len()];
+            ix.push(&name, &fold(&name), None, parent, 0, i as u64, i as u64);
+        }
+        let (rn, rp) = ix.compute_ranks();
+        ix.set_ranks(rn, rp);
+        ix
+    }
+
+    #[test]
+    fn ordered_view_matches_legacy_name_and_path_sort() {
+        let ix = populated_index();
+        assert!(ix.name_order().is_some());
+        assert!(ix.path_order().is_some());
+        let ids: Vec<u32> = (0..ix.len() as u32).filter(|i| i % 3 != 0).collect();
+        assert!(prefer_ordered_view(ix.len(), ids.len()));
+        for col in [SortCol::Name, SortCol::Path] {
+            for desc in [false, true] {
+                let mut expected = ids.clone();
+                legacy_rank_sort(&ix, &mut expected, col, desc);
+                let mut actual = ids.clone();
+                sort(&ix, &mut actual, col, desc);
+                assert_eq!(actual, expected, "有序视图结果不一致：{col:?} desc={desc}");
+            }
+        }
+    }
+
+    #[test]
+    fn stale_ordered_view_falls_back_to_partial_rank_sort() {
+        let mut ix = populated_index();
+        let name = "aaa-new.txt";
+        ix.push(name, &fold(name), None, 0, 0, 0, 0);
+        assert!(ix.name_order().is_none());
+        assert!(ix.path_order().is_none());
+        let ids: Vec<u32> = (0..ix.len() as u32).rev().collect();
+        for col in [SortCol::Name, SortCol::Path] {
+            let mut expected = ids.clone();
+            legacy_rank_sort(&ix, &mut expected, col, false);
+            let mut actual = ids.clone();
+            sort(&ix, &mut actual, col, false);
+            assert_eq!(actual, expected, "新增条目回退排序不一致：{col:?}");
+        }
+    }
+
+    #[test]
+    fn ordered_view_is_reserved_for_large_result_sets() {
+        assert!(!prefer_ordered_view(1_000_000, 1_000));
+        assert!(prefer_ordered_view(1_000_000, 100_000));
+        assert!(!prefer_ordered_view(1_000_000, 1));
     }
 }
 

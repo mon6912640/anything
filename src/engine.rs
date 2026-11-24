@@ -379,8 +379,7 @@ impl Engine {
         };
         let mut ix = self.index.write().unwrap();
         if self.generation.load(SeqCst) == generation && rn.len() <= ix.len() {
-            ix.rank_name = rn;
-            ix.rank_path = rp;
+            ix.set_ranks(rn, rp);
         }
     }
 

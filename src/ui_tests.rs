@@ -416,3 +416,148 @@ fn executable_path_cold_start_and_existing_instance() {
         println!("restart-with-saved-index: no automatic empty search; search and clear still work");
     }
 }
+
+/// 显式运行的大索引主进程压测；索引和设置均放在隔离目录，不访问真实文件。
+#[test]
+#[ignore = "explicit stress test with a synthetic one-million-entry saved index"]
+fn executable_large_index_search_clear_stress() {
+    use std::process::{Child, Command};
+    use std::time::{Duration, Instant};
+
+    struct RunningApp(Child);
+    impl Drop for RunningApp {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    fn wait_until(mut condition: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !condition() {
+            assert!(Instant::now() < deadline, "large-index UI test timed out");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+    fn controls(window: HWND) -> (HWND, HWND) {
+        let mut edit = null_mut();
+        let mut list = null_mut();
+        wait_until(|| unsafe {
+            edit = FindWindowExW(window, null_mut(), windows_sys::core::w!("Edit"), null());
+            list = FindWindowExW(window, null_mut(), WC_LISTVIEWW, null());
+            !edit.is_null() && !list.is_null()
+        });
+        (edit, list)
+    }
+    fn replace_text(edit: HWND, text: &str) {
+        unsafe {
+            send(edit, EM_SETSEL, 0, -1);
+            send(edit, EM_REPLACESEL, 1, wide(text).as_ptr() as isize);
+        }
+    }
+    fn wait_count(app: &mut Child, list: HWND, expected: usize) -> u128 {
+        let start = Instant::now();
+        wait_until(|| unsafe {
+            assert!(app.try_wait().unwrap().is_none(), "application exited during stress test");
+            send(list, LVM_GETITEMCOUNT, 0, 0) == expected as isize
+        });
+        start.elapsed().as_millis()
+    }
+
+    unsafe {
+        assert!(FindWindowW(wide(CLASS).as_ptr(), null()).is_null(), "close existing anything instances before stress test");
+    }
+    let files: usize = std::env::var("ANYTHING_UI_STRESS_ITEMS").ok().and_then(|s| s.parse().ok()).unwrap_or(1_000_000);
+    assert!(files >= 10_000);
+    let data = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/ui-validation").join(format!("stress-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&data);
+    std::fs::create_dir_all(&data).unwrap();
+    std::fs::write(data.join("settings.ini"), "roots=X:\\anything-synthetic-not-real\nexcludes=\nhotkey=Ctrl+Alt+Shift+F11\nrescan_on_start=0\nthreads=2\npinyin=0\n").unwrap();
+
+    const DIRS: usize = 244;
+    let started = Instant::now();
+    let mut ix = Index::with_capacity(files + DIRS + 1, files * 24);
+    let root = ix.push_nomap("Z:", b"z:", None, NONE, F_DIR, 0, 0);
+    let mut dirs = Vec::new();
+    for d in 0..DIRS {
+        let name = format!("dir{d:04}");
+        dirs.push(ix.push_nomap(&name, name.as_bytes(), None, root, F_DIR, 0, 0));
+    }
+    for i in 0..files {
+        let stem = if i % 10 == 0 { "document" } else { "file" };
+        let name = format!("{stem}{:07}.txt", (i * 7919) % files);
+        ix.push_nomap(&name, name.as_bytes(), None, dirs[i % DIRS], 0, 0, 0);
+    }
+    anything::store::save(&ix, &data.join("index.bin")).unwrap();
+    let total = ix.len();
+    drop(ix);
+    println!("stress setup: {total} entries saved in {} ms", started.elapsed().as_millis());
+
+    let executable = std::env::var_os("ANYTHING_UI_TEST_EXE").expect("set ANYTHING_UI_TEST_EXE to the executable being verified");
+    let mut running = RunningApp(Command::new(&executable).env("ANYTHING_DATA_DIR", &data).spawn().unwrap());
+    let mut window = null_mut();
+    wait_until(|| unsafe {
+        window = FindWindowW(wide(CLASS).as_ptr(), null());
+        !window.is_null()
+    });
+    let (mut edit, mut list) = controls(window);
+    let ae = std::path::Path::new(&executable).parent().unwrap().join("ae.exe");
+    let status = format!("已索引 {} 个对象", anything::util::group_digits(total as u64));
+    wait_until(|| {
+        let out = Command::new(&ae).arg("-status").env("ANYTHING_DATA_DIR", &data).output().unwrap();
+        String::from_utf8_lossy(&out.stdout).contains(&status)
+    });
+    // 启动排名在后台计算；留出时间后覆盖有序视图路径，回退路径由单元测试覆盖。
+    std::thread::sleep(Duration::from_millis(500));
+
+    for (query, expected) in [("file", files * 9 / 10), ("document", files / 10), ("file", files * 9 / 10)] {
+        let search_ms = {
+            replace_text(edit, query);
+            wait_count(&mut running.0, list, expected)
+        };
+        let clear_ms = {
+            replace_text(edit, "");
+            wait_count(&mut running.0, list, 0)
+        };
+        assert!(clear_ms < 5_000, "clearing {expected} results took {clear_ms} ms");
+        println!("stress UI: {query:?} -> {expected} results in {search_ms} ms; clear in {clear_ms} ms");
+    }
+
+    // 旧搜索尚未完成时清空，取消后旧结果不得重新填回列表。
+    replace_text(edit, "file");
+    std::thread::sleep(Duration::from_millis(100));
+    replace_text(edit, "document");
+    replace_text(edit, "");
+    wait_count(&mut running.0, list, 0);
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(unsafe { send(list, LVM_GETITEMCOUNT, 0, 0) }, 0, "cancelled search repopulated an empty query");
+    assert!(running.0.try_wait().unwrap().is_none());
+    println!("stress UI: rapid query replacement and cancellation passed");
+
+    // 带保存索引重启后重复大结果搜索和清空。
+    unsafe { PostMessageW(window, WM_COMMAND, IDM_EXIT, 0); }
+    wait_until(|| running.0.try_wait().unwrap().is_some());
+    assert!(running.0.wait().unwrap().success());
+    running.0 = Command::new(&executable).env("ANYTHING_DATA_DIR", &data).spawn().unwrap();
+    window = null_mut();
+    wait_until(|| unsafe {
+        window = FindWindowW(wide(CLASS).as_ptr(), null());
+        !window.is_null()
+    });
+    (edit, list) = controls(window);
+    wait_until(|| {
+        let out = Command::new(&ae).arg("-status").env("ANYTHING_DATA_DIR", &data).output().unwrap();
+        String::from_utf8_lossy(&out.stdout).contains(&status)
+    });
+    std::thread::sleep(Duration::from_millis(500));
+    replace_text(edit, "file");
+    let restart_search_ms = wait_count(&mut running.0, list, files * 9 / 10);
+    replace_text(edit, "");
+    let restart_clear_ms = wait_count(&mut running.0, list, 0);
+    assert!(restart_clear_ms < 5_000);
+    println!("stress restart: search in {restart_search_ms} ms; clear in {restart_clear_ms} ms");
+
+    unsafe { PostMessageW(window, WM_COMMAND, IDM_EXIT, 0); }
+    wait_until(|| running.0.try_wait().unwrap().is_some());
+    assert!(running.0.wait().unwrap().success());
+    std::fs::remove_dir_all(&data).unwrap();
+}

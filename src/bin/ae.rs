@@ -371,8 +371,7 @@ fn run() -> Result<(), (u8, String)> {
     }
     if matches!(o.req.sort, SortCol::Name | SortCol::Path) && ids.len() > 1 {
         let (rn, rp) = ix.compute_ranks();
-        ix.rank_name = rn;
-        ix.rank_path = rp;
+        ix.set_ranks(rn, rp);
     }
     query::sort(&ix, &mut ids, o.req.sort, o.req.desc);
     pr.begin().map_err(io_err)?;

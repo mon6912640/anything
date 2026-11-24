@@ -50,6 +50,10 @@ pub struct Index {
     /// 预先算好的排序名次（可能比条目数短：新增条目尚未参与排名）
     pub rank_name: Vec<u32>,
     pub rank_path: Vec<u32>,
+    /// 名次表的逆向视图：按名称/路径顺序排列的条目 ID。
+    /// 大结果集可沿视图直接收集，避免每次搜索重新排序。
+    order_name: Vec<u32>,
+    order_path: Vec<u32>,
     pub deleted: usize,
 }
 
@@ -412,6 +416,8 @@ impl Index {
         self.deleted += o.deleted;
         self.rank_name.clear();
         self.rank_path.clear();
+        self.order_name.clear();
+        self.order_path.clear();
     }
 
     /// 目录被删除后，把它下面的所有条目也标记为删除
@@ -463,6 +469,31 @@ impl Index {
 
     pub fn unranked(&self) -> usize {
         self.len() - self.rank_name.len()
+    }
+
+    /// 同时安装名次及其逆向有序视图；逆视图只在线性时间内建立一次。
+    pub fn set_ranks(&mut self, rank_name: Vec<u32>, rank_path: Vec<u32>) {
+        fn invert(rank: &[u32]) -> Vec<u32> {
+            let mut order = vec![0; rank.len()];
+            for (id, &r) in rank.iter().enumerate() {
+                order[r as usize] = id as u32;
+            }
+            order
+        }
+        debug_assert_eq!(rank_name.len(), rank_path.len());
+        self.order_name = invert(&rank_name);
+        self.order_path = invert(&rank_path);
+        self.rank_name = rank_name;
+        self.rank_path = rank_path;
+    }
+
+    /// 排名覆盖当前全部条目时，可直接按此顺序收集搜索结果。
+    pub fn name_order(&self) -> Option<&[u32]> {
+        (self.rank_name.len() == self.len() && self.order_name.len() == self.len()).then_some(&self.order_name)
+    }
+
+    pub fn path_order(&self) -> Option<&[u32]> {
+        (self.rank_path.len() == self.len() && self.order_path.len() == self.len()).then_some(&self.order_path)
     }
 
     /// 计算名称、路径两种排序名次（只读，可在读锁下后台进行）
@@ -549,6 +580,10 @@ impl Index {
         self.py_buf.shrink_to_fit();
         self.py_off.shrink_to_fit();
         self.py_owner.shrink_to_fit();
+        self.rank_name.shrink_to_fit();
+        self.rank_path.shrink_to_fit();
+        self.order_name.shrink_to_fit();
+        self.order_path.shrink_to_fit();
     }
 
     /// 估算内存占用（字节）
@@ -566,5 +601,7 @@ impl Index {
             + self.slots.capacity() * 4
             + self.rank_name.capacity() * 4
             + self.rank_path.capacity() * 4
+            + self.order_name.capacity() * 4
+            + self.order_path.capacity() * 4
     }
 }
