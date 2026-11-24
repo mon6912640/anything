@@ -262,6 +262,79 @@ fn native_edit_directory_query_then_type_and_search() {
     }
 }
 
+#[test]
+fn native_settings_save_cancel_and_defaults() {
+    use std::sync::{Arc, Mutex};
+
+    let parent = TestWindow::new();
+    let saved = Arc::new(Mutex::new(Vec::new()));
+    let mut custom = Config::default();
+    custom.set_roots(vec![r"D:\Work\".into(), r"E:\Archive".into()]);
+    custom.set_excludes(vec!["Node_Modules".into(), r"D:\Temp\".into()]);
+    custom.hotkey = "Ctrl+Alt+Space".into();
+    custom.rescan_on_start = anything::config::Rescan::Off;
+    custom.threads = 7;
+    custom.hdd_threads = 3;
+    custom.pinyin = false;
+
+    let open = |config: Config, saved: &Arc<Mutex<Vec<settings::Preferences>>>| {
+        let saved = Arc::clone(saved);
+        settings::show(parent.0, config, true, false, null_mut(), move |prefs| {
+            saved.lock().unwrap().push(prefs);
+            Ok(())
+        });
+        let window = unsafe { FindWindowW(wide("AnythingSettingsWindow").as_ptr(), null()) };
+        assert!(!window.is_null());
+        assert_eq!(unsafe { IsWindowEnabled(parent.0) }, 0);
+        window
+    };
+
+    let window = open(custom.clone(), &saved);
+    unsafe {
+        assert_eq!(get_text(GetDlgItem(window, settings::ROOTS as i32)), "D:\\Work\r\nE:\\Archive");
+        assert_eq!(get_text(GetDlgItem(window, settings::EXCLUDES as i32)), "Node_Modules\r\nD:\\Temp");
+        SetWindowTextW(GetDlgItem(window, settings::THREADS as i32), wide("9").as_ptr());
+        SendMessageW(window, WM_COMMAND, settings::SAVE, 0);
+        assert!(IsWindow(window) == 0);
+        assert_ne!(IsWindowEnabled(parent.0), 0);
+    }
+    {
+        let records = saved.lock().unwrap();
+        assert_eq!(records.len(), 1);
+        let prefs = &records[0];
+        assert_eq!(prefs.config.roots, custom.roots);
+        assert_eq!(prefs.config.excludes, custom.excludes);
+        assert_eq!(prefs.config.hotkey, custom.hotkey);
+        assert_eq!(prefs.config.threads, 9);
+        assert_eq!(prefs.config.hdd_threads, 3);
+        assert!(!prefs.config.pinyin);
+        assert!(prefs.autostart);
+        assert!(!prefs.context_menu);
+    }
+
+    let window = open(custom, &saved);
+    unsafe {
+        SendMessageW(window, WM_COMMAND, settings::DEFAULTS, 0);
+        assert_eq!(get_text(GetDlgItem(window, settings::THREADS as i32)), "12");
+        assert_eq!(get_text(GetDlgItem(window, settings::HOTKEY as i32)), "Ctrl+Alt+F");
+        assert_eq!(saved.lock().unwrap().len(), 1, "恢复默认不能提前保存");
+        SendMessageW(window, WM_COMMAND, settings::CANCEL, 0);
+        assert!(IsWindow(window) == 0);
+        assert_ne!(IsWindowEnabled(parent.0), 0);
+    }
+    assert_eq!(saved.lock().unwrap().len(), 1, "取消不能调用保存回调");
+}
+
+#[test]
+fn hotkey_parser_accepts_supported_combinations_and_rejects_invalid_input() {
+    assert_eq!(parse_hotkey("Ctrl+Alt+F"), Some((MOD_CONTROL | MOD_ALT, 'F' as u32)));
+    assert_eq!(parse_hotkey(" shift + space "), Some((MOD_SHIFT, VK_SPACE as u32)));
+    assert_eq!(parse_hotkey("Win+F24"), Some((MOD_WIN, VK_F24 as u32)));
+    for invalid in ["", "Ctrl+Alt", "Ctrl+Unknown", "Ctrl+F25"] {
+        assert_eq!(parse_hotkey(invalid), None, "{invalid}");
+    }
+}
+
 /// 运行前构建 release，并设置 ANYTHING_UI_TEST_EXE；需要没有其他 anything 实例。
 #[test]
 #[ignore = "explicitly launch the built application in an isolated test data directory"]
@@ -377,11 +450,68 @@ fn executable_path_cold_start_and_existing_instance() {
         append_and_check(edit, list, second.to_str().unwrap(), 3);
         println!("existing-instance --path: separator, caret and search results passed");
 
+        // 普通隐藏再唤出：焦点回到搜索框并全选旧查询，输入一次即可完整替换。
+        let previous = remote_text(edit);
+        assert!(!previous.is_empty());
+        PostMessageW(window, WM_CLOSE, 0, 0);
+        wait_until(|| IsWindowVisible(window) == 0);
+        PostMessageW(window, WM_APP_SHOW, 0, 0);
+        let thread = GetWindowThreadProcessId(window, null_mut());
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let mut start = 0u32;
+            let mut end = 0u32;
+            send(edit, EM_GETSEL, &mut start as *mut _ as usize, &mut end as *mut _ as isize);
+            let mut info: GUITHREADINFO = std::mem::zeroed();
+            info.cbSize = std::mem::size_of::<GUITHREADINFO>() as u32;
+            let got_info = GetGUIThreadInfo(thread, &mut info) != 0;
+            let ready = IsWindowVisible(window) != 0
+                && got_info
+                && info.hwndFocus == edit
+                && start == 0
+                && end as usize == previous.encode_utf16().count();
+            if ready { break; }
+            assert!(Instant::now() < deadline,
+                "show state: visible={}, got_info={}, focus={:?}, edit={:?}, selection={}..{}, expected=0..{}, foreground={:?}",
+                IsWindowVisible(window), got_info, info.hwndFocus, edit, start, end,
+                previous.encode_utf16().count(), GetForegroundWindow());
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        send(edit, EM_REPLACESEL, 1, wide("needle").as_ptr() as isize);
+        assert_eq!(remote_text(edit), "needle");
+        wait_until(|| send(list, LVM_GETITEMCOUNT, 0, 0) == 2);
+        println!("hide-and-show: search box focused, old query fully selected and replaced");
+
         // 搜索成功后手动清空：应立即得到空列表，进程继续响应。
         replace_text(edit, "");
         wait_until(|| send(list, LVM_GETITEMCOUNT, 0, 0) == 0);
         assert!(running.0.try_wait().unwrap().is_none());
         println!("clear-after-search: empty results without a background match-all passed");
+
+        // 真实主菜单打开设置，只改线程数：保存到隔离目录，且不得重建索引。
+        let index_before = std::fs::read(data.join("index.bin")).unwrap();
+        PostMessageW(window, WM_COMMAND, IDM_SETTINGS, 0);
+        let mut settings_window = null_mut();
+        wait_until(|| {
+            settings_window = FindWindowW(wide("AnythingSettingsWindow").as_ptr(), null());
+            !settings_window.is_null()
+        });
+        let mut threads = null_mut();
+        wait_until(|| {
+            threads = GetDlgItem(settings_window, settings::THREADS as i32);
+            !threads.is_null()
+        });
+        replace_text(threads, "3");
+        assert_eq!(remote_text(threads), "3");
+        SendMessageW(settings_window, WM_COMMAND, settings::SAVE, 0);
+        wait_until(|| FindWindowW(wide("AnythingSettingsWindow").as_ptr(), null()).is_null());
+        let saved = std::fs::read_to_string(data.join("settings.ini")).unwrap();
+        assert!(saved.contains("threads=3\n"), "{saved}");
+        assert!(saved.contains(&format!("roots={}\n", data.join("files").display())), "{saved}");
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(std::fs::read(data.join("index.bin")).unwrap(), index_before, "普通选项保存不应重扫或改写索引");
+        assert!(running.0.try_wait().unwrap().is_none());
+        println!("settings-window: save applied without rescanning or rewriting the index");
 
         // 正常退出以保存索引，再以空搜索框启动。索引加载完成通知不能触发全量搜索。
         PostMessageW(window, WM_COMMAND, IDM_EXIT, 0);

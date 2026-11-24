@@ -33,6 +33,8 @@ use windows_sys::Win32::UI::Shell::*;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 use windows_sys::core::GUID;
 
+mod settings;
+
 const CLASS: &str = "AnythingMainWindow";
 const TITLE: &str = "anything";
 
@@ -103,7 +105,7 @@ const HELP_TEXT: &str = "搜索语法（与 Everything 接近）：
   \"a b\"            引号包住含空格的词
 
 快捷键：
-  全局呼出/隐藏     见设置文件 hotkey（默认 Ctrl+Alt+F）
+  全局呼出/隐藏     在“文件 → 设置”中修改（默认 Ctrl+Alt+F）
   ↓               从搜索框进入结果列表
   Enter           打开        Ctrl+Enter   打开所在文件夹
   Ctrl+C          复制完整路径  Ctrl+Shift+C 复制文件（可在资源管理器粘贴）
@@ -474,14 +476,18 @@ fn main() {
             SetFocus(app().edit);
         }
         if let Some(ref path) = init_path {
+            if start_hidden { show_main(); }
+            // 目录限定查询需要保留末尾光标，便于紧接着输入文件名。
             set_search_text(app().edit, &dir_query(path));
             start_search(false);
-            if start_hidden { show_main(); }
         }
         SetTimer(hwnd, TIMER_UI, 500, None);
 
         let mut msg: MSG = std::mem::zeroed();
         while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
+            if settings::handle_message(&mut msg) {
+                continue;
+            }
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
@@ -496,8 +502,8 @@ unsafe fn build_menu() -> HMENU {
             AppendMenuW(m, MF_STRING, id, wide(s).as_ptr());
         };
         add(file, IDM_RESCAN, "立即重建索引(&R)\tF5");
-        add(file, IDM_SETTINGS, "编辑设置文件(&S)…");
-        add(file, IDM_RELOAD, "重新加载设置并重建索引(&L)");
+        add(file, IDM_SETTINGS, "设置(&S)…");
+        add(file, IDM_RELOAD, "重新加载设置文件并重建索引(&L)");
         add(file, IDM_AUTOSTART, "开机自动启动(&A)");
         add(file, IDM_CTXMENU, "资源管理器右键菜单(&E)");
         add(file, IDM_DATADIR, "打开数据目录(&D)");
@@ -673,8 +679,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     let len = cds.cbData as usize / 2;
                     let slice = std::slice::from_raw_parts(cds.lpData as *const u16, len);
                     let query = String::from_utf16_lossy(slice);
-                    set_search_text(a.edit, &query);
                     show_main();
+                    // show_main 会全选旧查询；新目录查询随后写入并恢复末尾光标。
+                    set_search_text(a.edit, &query);
                     start_search(false);
                 }
                 return 1;
@@ -2057,6 +2064,38 @@ unsafe extern "system" fn pv_proc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
 
 // ---------------------------------------------------------------- 菜单命令
 
+fn apply_preferences(prefs: settings::Preferences) -> Result<(), String> {
+    let a = app();
+    let previous = a.engine.cfg();
+    let hotkey_changed = previous.hotkey != prefs.config.hotkey;
+    if hotkey_changed {
+        change_hotkey(&previous.hotkey, &prefs.config.hotkey)?;
+    }
+    if let Err(e) = prefs.config.save() {
+        if hotkey_changed {
+            let _ = change_hotkey(&prefs.config.hotkey, &previous.hotkey);
+        }
+        return Err(format!("设置文件写入失败：{e}"));
+    }
+    if prefs.autostart != autostart_get() {
+        autostart_set(prefs.autostart);
+    }
+    if prefs.context_menu != ctxmenu_get() {
+        ctxmenu_set(prefs.context_menu);
+    }
+    unsafe {
+        let file = GetSubMenu(a.menu, 0);
+        CheckMenuItem(file, IDM_AUTOSTART as u32, if prefs.autostart { MF_CHECKED } else { MF_UNCHECKED });
+        CheckMenuItem(file, IDM_CTXMENU as u32, if prefs.context_menu { MF_CHECKED } else { MF_UNCHECKED });
+    }
+    let pinyin_changed = previous.pinyin != prefs.config.pinyin;
+    a.engine.apply_config();
+    if pinyin_changed {
+        start_search(true);
+    }
+    Ok(())
+}
+
 fn on_command(id: usize) {
     let a = app();
     match id {
@@ -2067,9 +2106,9 @@ fn on_command(id: usize) {
                 a.engine.rescan();
             }
         }
-        IDM_SETTINGS => unsafe {
-            let _ = Config::load(); // 确保文件存在
-            ShellExecuteW(a.hwnd, wide("open").as_ptr(), wide("notepad.exe").as_ptr(), wide(&format!("\"{}\"", config::settings_path().display())).as_ptr(), null(), SW_SHOWNORMAL);
+        IDM_SETTINGS => {
+            let cfg = a.engine.cfg();
+            settings::show(a.hwnd, (*cfg).clone(), autostart_get(), ctxmenu_get(), a.font, apply_preferences);
         },
         IDM_RELOAD => {
             a.engine.reload_config();
@@ -2107,7 +2146,7 @@ fn on_command(id: usize) {
         IDM_ABOUT => {
             let ix = a.engine.index.read().unwrap();
             let s = format!(
-                "anything {}\n无需管理员权限的本地文件名搜索\n\n已索引 {} 个对象\n索引内存约 {:.0} MB\n数据目录：{}",
+                "anything {}\n无需管理员权限的本地文件名搜索\n\n项目地址：https://github.com/mon6912640/anything\n已索引 {} 个对象\n索引内存约 {:.0} MB\n数据目录：{}",
                 env!("CARGO_PKG_VERSION"),
                 group_digits(ix.alive() as u64),
                 ix.mem_bytes() as f64 / 1048576.0,
@@ -2128,8 +2167,8 @@ fn show_main() {
         ShowWindow(a.hwnd, if IsIconic(a.hwnd) != 0 { SW_RESTORE } else { SW_SHOW });
         SetForegroundWindow(a.hwnd);
         SetFocus(a.edit);
-        let n = GetWindowTextLengthW(a.edit);
-        if n == 0 { send(a.edit, EM_SETSEL, 0, -1); } else { send(a.edit, EM_SETSEL, n as usize, n as isize); }
+        // 普通重新唤出通常意味着开始下一次搜索；全选旧词，直接输入即可替换。
+        send(a.edit, EM_SETSEL, 0, -1);
     }
     if a.refresh_wanted {
         start_search(true);
@@ -2232,6 +2271,27 @@ fn parse_hotkey(s: &str) -> Option<(u32, u32)> {
     if vk == 0 { None } else { Some((mods, vk)) }
 }
 
+/// 设置窗口保存前尝试切换；失败时恢复原快捷键，配置不会写入。
+fn change_hotkey(old: &str, new: &str) -> Result<(), String> {
+    if old == new {
+        return Ok(());
+    }
+    let Some((mods, vk)) = parse_hotkey(new) else {
+        return Err(format!("无法识别的快捷键：{new}\n支持 Ctrl、Alt、Shift、Win 与 F1～F24、字母、数字、Space 等组合。"));
+    };
+    let a = app();
+    unsafe {
+        UnregisterHotKey(a.hwnd, HOTKEY_ID);
+        if RegisterHotKey(a.hwnd, HOTKEY_ID, mods | MOD_NOREPEAT, vk) != 0 {
+            return Ok(());
+        }
+        if let Some((mods, vk)) = parse_hotkey(old) {
+            RegisterHotKey(a.hwnd, HOTKEY_ID, mods | MOD_NOREPEAT, vk);
+        }
+    }
+    Err(format!("全局快捷键 {new} 已被其他程序占用，已保留原快捷键。"))
+}
+
 fn register_hotkey() {
     let a = app();
     let hk = a.engine.cfg().hotkey.clone();
@@ -2240,7 +2300,7 @@ fn register_hotkey() {
         match parse_hotkey(&hk) {
             Some((mods, vk)) => {
                 if RegisterHotKey(a.hwnd, HOTKEY_ID, mods | MOD_NOREPEAT, vk) == 0 {
-                    message_box(&format!("全局快捷键 {hk} 已被其他程序占用。\n可在“文件 → 编辑设置文件”中修改 hotkey。"), TITLE, MB_ICONWARNING);
+                    message_box(&format!("全局快捷键 {hk} 已被其他程序占用。\n可在“文件 → 设置”中修改快捷键。"), TITLE, MB_ICONWARNING);
                 }
             }
             None => {

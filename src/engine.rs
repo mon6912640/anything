@@ -175,9 +175,27 @@ impl Engine {
         *w = Some(Watchers::start(&roots, self.tx.clone()));
     }
 
-    /// 重新读取配置文件：重新监视并重扫
+    /// 手工重新加载：保持原有行为，重新监视并重扫。
     pub fn reload_config(self: &Arc<Self>) {
-        *self.cfg.write().unwrap() = Arc::new(Config::load());
+        self.reload_config_impl(true);
+    }
+
+    /// 设置窗口保存：普通选项立即更新，只有索引范围变化才重扫。
+    pub fn apply_config(self: &Arc<Self>) {
+        self.reload_config_impl(false);
+    }
+
+    fn reload_config_impl(self: &Arc<Self>, force_rescan: bool) {
+        let previous = self.cfg();
+        let next = Config::load();
+        let reindex = force_rescan
+            || previous.roots != next.roots
+            || previous.ex_paths != next.ex_paths
+            || previous.ex_names != next.ex_names;
+        *self.cfg.write().unwrap() = Arc::new(next);
+        if !reindex {
+            return;
+        }
         self.restart_watchers();
         if self.scanning.load(SeqCst) {
             self.scan_cancel.store(true, SeqCst);

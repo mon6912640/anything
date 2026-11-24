@@ -9,15 +9,18 @@
 | `anything.exe` | 主程序（图形界面 + 托盘 + 后台索引） |
 | `ae.exe` | 命令行搜索工具（类似 Everything 的 `es.exe`），供脚本和第三方程序调用 |
 
-两个文件放在同一目录即可，直接双击 `anything.exe` 运行。不需要安装，不需要管理员权限，不需要 .NET 或 VC++ 运行库。
+两个程序文件放在同一目录即可，直接双击 `anything.exe` 运行。不需要安装，不需要管理员权限，不需要 .NET 或 VC++ 运行库。
 
-**便携模式**：exe 同目录下有 `settings.ini` 时（发布的便携版压缩包自带一份），所有数据都保存在这个文件夹里，可以整个文件夹拷走或放 U 盘。没有 `settings.ini` 时数据保存在 `%LOCALAPPDATA%\anything\`。
+**便携模式**：发布包中的空文件 `portable.flag` 是便携模式标记，配置、索引和界面状态都保存在 exe 所在目录，可以整个文件夹拷走或放 U 盘。旧版目录已有的 `settings.ini` 也会继续启用便携模式。两种标记都没有时，数据保存在 `%LOCALAPPDATA%\anything\`。
 
-数据文件：
+数据文件（均不会包含在发布包中）：
 
-- `settings.ini`：设置（索引哪些盘、排除目录、快捷键等），首次运行自动生成，里面有注释
+- `settings.ini`：用户设置，在设置窗口点击“保存”时生成或更新
+- `settings.ini.bak`：保存前的上一版设置，用于异常恢复
 - `index.bin`：索引文件
 - `ui.ini`：界面状态（预览面板开关、宽度），程序自动维护
+
+**覆盖升级**：直接解压新版覆盖程序文件即可。发布包只更新 exe、README 和 `portable.flag`，不会覆盖上述用户数据。
 
 ## 工作原理
 
@@ -153,19 +156,18 @@ with open(name, "r+b", buffering=0) as p:
 
 可用的键：`cmd`（search / status / rescan）、`q`、`sort`（name / path / size / date / none）、`desc`（0/1）、`offset`、`max`。
 
-## 设置（settings.ini）
+## 设置
 
-```ini
-roots=                 ; 要索引的目录，| 分隔；留空 = 所有本地固定磁盘
-excludes=C:\Windows\WinSxS|$Recycle.Bin|System Volume Information
-hotkey=Ctrl+Alt+F
-rescan_on_start=1      ; 启动时后台重扫
-threads=12             ; 固态盘扫描线程
-hdd_threads=4          ; 机械盘扫描线程
-pinyin=1               ; 拼音首字母搜索
-```
+菜单“文件 → 设置”打开原生设置窗口，可以修改：
 
-修改后在菜单“文件 → 重新加载设置”或重启生效。“文件 → 开机自动启动”写入当前用户的注册表启动项，不需要管理员权限。
+- 索引目录与排除规则，支持浏览并添加文件夹；索引目录留空表示所有本地固定磁盘
+- 全局呼出快捷键、拼音首字母搜索
+- 开机自动启动、资源管理器右键菜单（仅当前用户，不需要管理员权限）
+- 启动时重扫方式、固态盘和机械盘扫描线程数（1～64）
+
+点击“保存”后立即应用；索引范围不变时不会重扫。“恢复默认”先恢复窗口中的配置值，再点保存才会写入。“取消”不修改任何文件。
+
+旧版 `settings.ini` 可以直接使用。以后新增配置项时，旧文件缺少的项目自动使用程序内置默认值，无需手工补文本。仍可手工编辑 `settings.ini`，然后在菜单选择“重新加载设置文件并重建索引”或重启。
 
 ## 编译
 
@@ -182,3 +184,11 @@ cargo build --release
 ```
 
 产物在 `target\x86_64-pc-windows-msvc\release\`，静态链接 C 运行库，可直接拷到其他 Win10/11 机器运行。
+
+打包便携版：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File build-dist.ps1
+```
+
+生成 `dist\anything-<版本>-portable.zip`。打包脚本会检查压缩目录中不含 `settings.ini`、`settings.ini.bak`、`index.bin` 和 `ui.ini`，避免升级覆盖用户数据。
